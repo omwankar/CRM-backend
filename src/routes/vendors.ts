@@ -1,0 +1,74 @@
+import express from 'express';
+import { z } from 'zod';
+import { createClient } from '@supabase/supabase-js';
+import { authMiddleware } from '../middleware/auth.js';
+import { auditLog } from '../middleware/auditLog.js';
+
+const router = express.Router();
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+router.use(authMiddleware);
+router.use(auditLog);
+
+const schema = z.object({
+  vendor_name: z.string().min(1),
+  vendor_type: z.enum(['product', 'service', 'both']).optional(),
+  contact_person: z.string().optional(),
+  contact_email: z.string().optional(),
+  contact_phone: z.string().optional(),
+  address: z.string().optional(),
+  city: z.string().optional(),
+  state: z.string().optional(),
+  postal_code: z.string().optional(),
+  country: z.string().optional(),
+  website: z.string().optional(),
+  description: z.string().optional(),
+  contract_url: z.string().optional(),
+  vendor_portal_link: z.string().optional(),
+});
+
+const updateSchema = schema.partial();
+
+router.get('/', async (req, res) => {
+  const { search, vendor_type, page = '1', limit = '20' } = req.query;
+  let query = supabase.from('vendors').select('*', { count: 'exact' }).is('deleted_at', null);
+  if (vendor_type) query = query.eq('vendor_type', vendor_type);
+  if (search) query = query.ilike('vendor_name', `%${search}%`);
+  const p = Math.max(1, Number(page)), l = Math.min(100, Number(limit));
+  query = query.range((p - 1) * l, p * l - 1).order('created_at', { ascending: false });
+  const { data, count, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
+});
+
+router.get('/:id', async (req, res) => {
+  const { data, error } = await supabase.from('vendors').select('*').eq('id', req.params.id).is('deleted_at', null).maybeSingle();
+  if (error || !data) return res.status(404).json({ error: 'Not found' });
+  res.json(data);
+});
+
+router.post('/', async (req, res) => {
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+  const { data, error } = await supabase.from('vendors').insert(parsed.data).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+router.put('/:id', async (req, res) => {
+  const parsed = updateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+  const { data, error } = await supabase.from('vendors').update(parsed.data).eq('id', req.params.id).is('deleted_at', null).select().single();
+  if (error || !data) return res.status(404).json({ error: 'Not found' });
+  res.json(data);
+});
+
+router.delete('/:id', async (req, res) => {
+  const { data, error } = await supabase.from('vendors').update({ deleted_at: new Date().toISOString() }).eq('id', req.params.id).is('deleted_at', null).select().single();
+  if (error || !data) return res.status(404).json({ error: 'Not found' });
+  res.json({ success: true });
+});
+
+export function registerVendorRoutes(api: express.Router) {
+  api.use('/vendors', router);
+}
