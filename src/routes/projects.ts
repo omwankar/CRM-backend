@@ -1,6 +1,7 @@
 import express from 'express';
 import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
+import { authMiddleware } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -9,10 +10,13 @@ const supabaseUrl = process.env.SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+router.use(authMiddleware);
+
 // Validation schemas
 const createProjectSchema = z.object({
   project_name: z.string().min(1, 'Project name is required'),
-  contact_person: z.string().min(1, 'Contact person is required'),
+  assigned_person_id: z.string().uuid().nullable().optional(),
+  supervisor_id: z.string().uuid().nullable().optional(),
   contact_email: z.string().email().optional().or(z.literal('')),
   contact_phone: z.string().optional(),
   start_date: z.string().optional(),
@@ -25,7 +29,8 @@ const createProjectSchema = z.object({
 
 const updateProjectSchema = z.object({
   project_name: z.string().min(1).optional(),
-  contact_person: z.string().min(1).optional(),
+  assigned_person_id: z.string().uuid().nullable().optional(),
+  supervisor_id: z.string().uuid().nullable().optional(),
   contact_email: z.string().email().optional().or(z.literal('')),
   contact_phone: z.string().optional(),
   start_date: z.string().optional(),
@@ -38,7 +43,7 @@ const updateProjectSchema = z.object({
 const changeStatusSchema = z.object({
   status: z.enum(['Active', 'Planned', 'On Hold', 'Closed']),
   reason: z.string().min(1, 'Reason is required'),
-  changed_by: z.string().uuid(),
+  changed_by: z.string().uuid().optional(),
 });
 
 const addEmployeeSchema = z.object({
@@ -49,7 +54,7 @@ const addEmployeeSchema = z.object({
 // GET /api/projects - List all projects with filters
 router.get('/', async (req, res) => {
   try {
-    const { status, search, start_date, end_date, page = '1', limit = '20' } = req.query;
+    const { status, search, start_date, end_date, sort_by, sort_order, page = '1', limit = '20' } = req.query;
     
     const pageNum = parseInt(page as string);
     const limitNum = parseInt(limit as string);
@@ -66,7 +71,7 @@ router.get('/', async (req, res) => {
     }
 
     if (search) {
-      query = query.or(`project_name.ilike.%${search}%,contact_person.ilike.%${search}%,project_id.ilike.%${search}%`);
+      query = query.or(`project_name.ilike.%${search}%,project_id.ilike.%${search}%`);
     }
 
     if (start_date) {
@@ -77,10 +82,15 @@ router.get('/', async (req, res) => {
       query = query.lte('estimated_end_date', end_date);
     }
 
+    // Apply sorting
+    const allowedSortColumns = new Set(['created_at', 'start_date', 'estimated_end_date', 'project_name']);
+    const requestedSortBy = (sort_by as string) || 'created_at';
+    const sortBy = allowedSortColumns.has(requestedSortBy) ? requestedSortBy : 'created_at';
+    const sortOrder = sort_order as string || 'desc';
+    query = query.order(sortBy, { ascending: sortOrder === 'asc' });
+
     // Apply pagination
-    query = query
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limitNum - 1);
+    query = query.range(offset, offset + limitNum - 1);
 
     const { data, error, count } = await query;
 
@@ -88,8 +98,51 @@ router.get('/', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    const projects = data || [];
+    const personIds = new Set<string>();
+    projects.forEach((project: any) => {
+      if (project.assigned_person_id) personIds.add(project.assigned_person_id);
+      if (project.supervisor_id) personIds.add(project.supervisor_id);
+    });
+
+    let usersById: Record<string, any> = {};
+    if (personIds.size > 0) {
+      const { data: usersData } = await supabase
+        .from('users')
+        .select('id, email, full_name')
+        .in('id', Array.from(personIds));
+
+      usersById = (usersData || []).reduce((acc: Record<string, any>, user: any) => {
+        acc[user.id] = user;
+        return acc;
+      }, {});
+    }
+
+    const enrichedProjects = projects.map((project: any) => {
+      const assigned = project.assigned_person_id ? usersById[project.assigned_person_id] : null;
+      const supervisor = project.supervisor_id ? usersById[project.supervisor_id] : null;
+
+      return {
+        ...project,
+        assigned_person: assigned
+          ? {
+              id: assigned.id,
+              name: assigned.full_name || assigned.email || 'Unknown',
+              email: assigned.email || '',
+            }
+          : null,
+        supervisor: supervisor
+          ? {
+              id: supervisor.id,
+              name: supervisor.full_name || supervisor.email || 'Unknown',
+              email: supervisor.email || '',
+            }
+          : null,
+      };
+    });
+
     res.json({
-      projects: data || [],
+      projects: enrichedProjects,
       total: count || 0,
       page: pageNum,
       limit: limitNum,
@@ -117,21 +170,66 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // Get employees with user details
-    const { data: employees } = await supabase
+    // Fetch assigned person details
+    let assignedPerson = null;
+    if (project.assigned_person_id) {
+      const { data: apUser } = await supabase
+        .from('users')
+        .select('id, email, full_name')
+        .eq('id', project.assigned_person_id)
+        .maybeSingle();
+      if (apUser) {
+        assignedPerson = {
+          id: apUser.id,
+          name: apUser.full_name || apUser.email || 'Unknown',
+          email: apUser.email || '',
+        };
+      }
+    }
+
+    // Fetch supervisor details
+    let supervisor = null;
+    if (project.supervisor_id) {
+      const { data: supUser } = await supabase
+        .from('users')
+        .select('id, email, full_name')
+        .eq('id', project.supervisor_id)
+        .maybeSingle();
+      if (supUser) {
+        supervisor = {
+          id: supUser.id,
+          name: supUser.full_name || supUser.email || 'Unknown',
+          email: supUser.email || '',
+        };
+      }
+    }
+
+    // Get employees (without relational embed to avoid schema-cache FK dependency)
+    const { data: employees, error: employeesError } = await supabase
       .from('project_employees')
-      .select(`
-        id,
-        user_id,
-        role,
-        added_at,
-        users (
-          id,
-          email,
-          full_name
-        )
-      `)
+      .select('id, user_id, role, added_at')
       .eq('project_id', id);
+
+    if (employeesError) {
+      return res.status(500).json({ error: employeesError.message });
+    }
+
+    const employeeUserIds = Array.from(
+      new Set((employees || []).map((emp: any) => emp.user_id).filter(Boolean))
+    );
+
+    let employeeUsersById: Record<string, { id: string; email?: string | null; full_name?: string | null }> = {};
+    if (employeeUserIds.length > 0) {
+      const { data: usersData } = await supabase
+        .from('users')
+        .select('id, email, full_name')
+        .in('id', employeeUserIds);
+
+      employeeUsersById = (usersData || []).reduce((acc: Record<string, any>, user: any) => {
+        acc[user.id] = user;
+        return acc;
+      }, {});
+    }
 
     // Get attachments
     const { data: attachments } = await supabase
@@ -148,23 +246,31 @@ router.get('/:id', async (req, res) => {
       .order('received_at', { ascending: false });
 
     // Format employees with avatar initials
-    const formattedEmployees = (employees || []).map((emp: any) => ({
+    const formattedEmployees = (employees || []).map((emp: any) => {
+      const profile = employeeUsersById[emp.user_id];
+      const displayName = profile?.full_name || profile?.email || 'Unknown';
+      const displayEmail = profile?.email || '';
+
+      return {
       id: emp.id,
       user_id: emp.user_id,
-      name: emp.users?.full_name || emp.users?.email || 'Unknown',
-      email: emp.users?.email || '',
+      name: displayName,
+      email: displayEmail,
       role: emp.role,
-      avatar_initials: (emp.users?.full_name || emp.users?.email || 'U')
+      avatar_initials: (displayName || 'U')
         .split(' ')
         .map((n: string) => n[0])
         .join('')
         .toUpperCase()
         .slice(0, 2),
       added_at: emp.added_at,
-    }));
+    };
+    });
 
     res.json({
       ...project,
+      assigned_person: assignedPerson,
+      supervisor: supervisor,
       employees: formattedEmployees,
       attachments: attachments || [],
       emails: emails || [],
@@ -273,6 +379,10 @@ router.post('/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
     const body = changeStatusSchema.parse(req.body);
+    const actorId = body.changed_by || req.user?.id;
+    if (!actorId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
 
     // Get current status
     const { data: currentProject } = await supabase
@@ -306,7 +416,7 @@ router.post('/:id/status', async (req, res) => {
         old_status: currentProject.status,
         new_status: body.status,
         reason: body.reason,
-        changed_by: body.changed_by,
+        changed_by: actorId,
       });
 
     res.json(data);
@@ -325,18 +435,7 @@ router.get('/:id/history', async (req, res) => {
 
     const { data, error } = await supabase
       .from('project_status_history')
-      .select(`
-        id,
-        old_status,
-        new_status,
-        reason,
-        changed_by,
-        changed_at,
-        users (
-          full_name,
-          email
-        )
-      `)
+      .select('id, old_status, new_status, reason, changed_by, changed_at')
       .eq('project_id', id)
       .order('changed_at', { ascending: false });
 
@@ -344,12 +443,32 @@ router.get('/:id/history', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    const changedByIds = Array.from(
+      new Set((data || []).map((h: any) => h.changed_by).filter(Boolean))
+    );
+
+    let usersById: Record<string, { full_name?: string | null; email?: string | null }> = {};
+    if (changedByIds.length > 0) {
+      const { data: usersData } = await supabase
+        .from('users')
+        .select('id, full_name, email')
+        .in('id', changedByIds);
+
+      usersById = (usersData || []).reduce((acc: Record<string, any>, user: any) => {
+        acc[user.id] = user;
+        return acc;
+      }, {});
+    }
+
     const formattedHistory = (data || []).map((h: any) => ({
       id: h.id,
       old_status: h.old_status,
       new_status: h.new_status,
       reason: h.reason,
-      changed_by_name: h.users?.full_name || h.users?.email || 'Unknown',
+      changed_by_name:
+        usersById[h.changed_by]?.full_name ||
+        usersById[h.changed_by]?.email ||
+        'Unknown',
       changed_at: h.changed_at,
     }));
 
