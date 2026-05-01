@@ -27,9 +27,21 @@ const env = loadEnv();
 const app = express();
 app.disable("x-powered-by");
 
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://crm-o-9nwq-3oe1jpvb3-omwankars-projects.vercel.app",
+  env.FRONTEND_ORIGIN
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: env.FRONTEND_ORIGIN,
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     credentials: true
   })
 );
