@@ -13,6 +13,10 @@ router.get('/stats', async (req, res) => {
   const userRole = req.user?.role;
 
   try {
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     // Get counts for all modules
     const [
       { count: projectsCount },
@@ -92,15 +96,39 @@ router.get('/stats', async (req, res) => {
       .order('date', { ascending: true })
       .limit(10);
 
-    // Get user's tasks
-    const { data: myTasks } = await supabase
+    // Get user's tasks (assigned_person_id in current schema)
+    const { data: myTasksRaw } = await supabase
       .from('tasks')
-      .select('*')
-      .eq('assigned_to', userId)
-      .in('status', ['open', 'in_progress'])
+      .select('id, task_title, due_date, status')
+      .eq('assigned_person_id', userId)
+      .in('status', ['Pending', 'In Progress', 'On Hold'])
       .is('deleted_at', null)
       .order('due_date', { ascending: true })
       .limit(10);
+
+    const myTasks = (myTasksRaw || []).map((t: any) => ({
+      id: t.id,
+      title: t.task_title,
+      due_date: t.due_date,
+      status: t.status,
+    }));
+
+    // Get user's projects (assigned_person_id)
+    const { data: myProjectsRaw } = await supabase
+      .from('projects')
+      .select('id, project_name, estimated_end_date, status')
+      .eq('assigned_person_id', userId)
+      .neq('status', 'Closed')
+      .is('deleted_at', null)
+      .order('estimated_end_date', { ascending: true })
+      .limit(10);
+
+    const myProjects = (myProjectsRaw || []).map((p: any) => ({
+      id: p.id,
+      name: p.project_name,
+      end_date: p.estimated_end_date,
+      status: p.status,
+    }));
 
     res.json({
       stats: {
@@ -119,6 +147,7 @@ router.get('/stats', async (req, res) => {
       recentActivity,
       upcomingEvents,
       myTasks,
+      myProjects,
     });
   } catch (error) {
     res.status(500).json({ error: (error as Error).message });
