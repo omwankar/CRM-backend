@@ -21,6 +21,7 @@ import { registerDashboardRoutes } from "./routes/dashboard.js";
 import { registerUserRoutes } from "./routes/users.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerCommentRoutes } from "./routes/comments.js";
+import { registerQuotationRoutes } from "./routes/quotations.js";
 
 const env = loadEnv();
 
@@ -53,6 +54,7 @@ registerDashboardRoutes(api);
 registerUserRoutes(api);
 registerTaskRoutes(api);
 registerCommentRoutes(api);
+registerQuotationRoutes(api);
 app.use("/api", api);
 
 app.listen(env.PORT, () => {

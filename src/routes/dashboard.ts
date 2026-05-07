@@ -28,6 +28,7 @@ router.get('/stats', async (req, res) => {
       { count: insuranceCount },
       { count: documentsCount },
       { count: alertsCount },
+      { count: quotationsCount },
     ] = await Promise.all([
       supabase.from('projects').select('*', { count: 'exact', head: true }).is('deleted_at', null),
       supabase.from('buyers').select('*', { count: 'exact', head: true }).is('deleted_at', null),
@@ -38,6 +39,10 @@ router.get('/stats', async (req, res) => {
       supabase.from('insurance').select('*', { count: 'exact', head: true }).is('deleted_at', null),
       supabase.from('documents').select('*', { count: 'exact', head: true }),
       supabase.from('alerts').select('*', { count: 'exact', head: true }).eq('is_dismissed', false),
+      supabase
+        .from('quotations')
+        .select('*', { count: 'exact', head: true })
+        .not('status', 'in', '("approved","rejected","cancelled")'),
     ]);
 
     // Get today's clocked hours
@@ -140,6 +145,7 @@ router.get('/stats', async (req, res) => {
         partnerships: partnershipsCount || 0,
         insurance: insuranceCount || 0,
         documents: documentsCount || 0,
+        quotations: quotationsCount || 0,
         alerts: alertsCount || 0,
         hoursToday: Math.round(hoursToday * 100) / 100,
       },
