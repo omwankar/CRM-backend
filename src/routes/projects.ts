@@ -23,7 +23,7 @@ const createProjectSchema = z.object({
   estimated_end_date: z.string().optional(),
   requirements_notes: z.string().optional(),
   linked_email: z.string().email().optional().or(z.literal('')),
-  status: z.enum(['Active', 'Planned', 'On Hold', 'Closed']).default('Planned'),
+  status: z.enum(['Active', 'Planned', 'On Hold', 'Closed', 'Cancelled']).default('Planned'),
   created_by: z.string().uuid(),
 });
 
@@ -37,11 +37,11 @@ const updateProjectSchema = z.object({
   estimated_end_date: z.string().optional(),
   requirements_notes: z.string().optional(),
   linked_email: z.string().email().optional().or(z.literal('')),
-  status: z.enum(['Active', 'Planned', 'On Hold', 'Closed']).optional(),
+  status: z.enum(['Active', 'Planned', 'On Hold', 'Closed', 'Cancelled']).optional(),
 });
 
 const changeStatusSchema = z.object({
-  status: z.enum(['Active', 'Planned', 'On Hold', 'Closed']),
+  status: z.enum(['Active', 'Planned', 'On Hold', 'Closed', 'Cancelled']),
   reason: z.string().min(1, 'Reason is required'),
   changed_by: z.string().uuid().optional(),
 });
