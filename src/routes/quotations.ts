@@ -24,6 +24,7 @@ const createQuotationSchema = z.object({
   status: quotationStatus,
   enquiry_lead: z.string().uuid().optional().nullable(),
   project_id: z.string().uuid().optional().nullable(),
+  standalone_project_name: z.string().trim().min(1).optional().nullable(),
   client_budget: z.number().optional().nullable(),
   client_currency: z.string().optional().nullable(),
   client_price_notes: z.string().optional().nullable(),
@@ -118,9 +119,77 @@ router.get('/', async (req, res) => {
     const { data, count, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
 
+    const leadIds = Array.from(
+      new Set((data || []).map((q: any) => q.enquiry_lead).filter(Boolean)),
+    );
+    const rawProjectIds = Array.from(
+      new Set((data || []).map((q: any) => q.project_id).filter(Boolean)),
+    );
+    const uuidRe =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const projectUuidIds = rawProjectIds.filter((v: any) => typeof v === 'string' && uuidRe.test(v));
+    const projectCodeIds = rawProjectIds.filter((v: any) => typeof v === 'string' && !uuidRe.test(v));
+
+    const [{ data: leads, error: leadsErr }, { data: projects, error: projectsErr }] =
+      await Promise.all([
+        leadIds.length
+          ? supabase.from('users').select('id, full_name, avatar_url').in('id', leadIds)
+          : Promise.resolve({ data: [], error: null } as any),
+        rawProjectIds.length
+          ? (async () => {
+              const results: any[] = [];
+              if (projectUuidIds.length) {
+                const { data: byId, error } = await supabase
+                  .from('projects')
+                  .select('id, project_id, project_name')
+                  .in('id', projectUuidIds);
+                if (error) return { data: null, error };
+                results.push(...(byId || []));
+              }
+              if (projectCodeIds.length) {
+                const { data: byCode, error } = await supabase
+                  .from('projects')
+                  .select('id, project_id, project_name')
+                  .in('project_id', projectCodeIds);
+                if (error) return { data: null, error };
+                results.push(...(byCode || []));
+              }
+              return { data: results, error: null };
+            })()
+          : Promise.resolve({ data: [], error: null } as any),
+      ]);
+
+    if (leadsErr) return res.status(500).json({ error: leadsErr.message });
+    if (projectsErr) return res.status(500).json({ error: projectsErr.message });
+
+    const quotationIds = (data || []).map((q: any) => q.id).filter(Boolean);
+    const { data: vendorQuoteRows, error: vendorQuoteErr } = quotationIds.length
+      ? await supabase
+          .from('quotation_vendor_quotes')
+          .select('quotation_id')
+          .in('quotation_id', quotationIds)
+      : { data: [], error: null as any };
+
+    if (vendorQuoteErr) return res.status(500).json({ error: vendorQuoteErr.message });
+
+    const vendorCountByQuotationId = new Map<string, number>();
+    for (const r of vendorQuoteRows || []) {
+      const qid = (r as any).quotation_id as string;
+      vendorCountByQuotationId.set(qid, (vendorCountByQuotationId.get(qid) || 0) + 1);
+    }
+
+    const leadsById = new Map((leads || []).map((u: any) => [u.id, u]));
+    const projectsById = new Map((projects || []).map((p: any) => [p.id, p]));
+    const projectsByCode = new Map((projects || []).map((p: any) => [p.project_id, p]));
+
     res.json({
       data: (data || []).map((q: any) => ({
         ...q,
+        users: q.enquiry_lead ? leadsById.get(q.enquiry_lead) || null : null,
+        projects: q.project_id
+          ? projectsById.get(q.project_id) || projectsByCode.get(q.project_id) || null
+          : null,
+        vendor_quotes_count: vendorCountByQuotationId.get(q.id) || 0,
         // Keep UI stable even without nested selects.
         quotation_vendor_quotes: q.quotation_vendor_quotes || [],
         quotation_revisions: q.quotation_revisions || [],
