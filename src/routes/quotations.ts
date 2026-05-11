@@ -19,6 +19,15 @@ const quotationStatus = z.enum([
   'cancelled',
 ]);
 
+const enquiryStage = z.enum([
+  'new_enquiry',
+  'under_review',
+  'preparing',
+  'quote_sent',
+  'follow_up',
+  'won_lost_closed',
+]);
+
 const createQuotationSchema = z.object({
   requirement: z.string().min(10),
   status: quotationStatus,
@@ -29,6 +38,11 @@ const createQuotationSchema = z.object({
   client_currency: z.string().optional().nullable(),
   client_price_notes: z.string().optional().nullable(),
   deadline: z.string().optional().nullable(),
+  enquiry_title: z.string().optional().nullable(),
+  enquiry_stage: enquiryStage.optional(),
+  priority: z.enum(['low', 'medium', 'high']).optional(),
+  outcome: z.string().optional().nullable(),
+  tracker_remarks: z.string().optional().nullable(),
 });
 
 const updateQuotationSchema = createQuotationSchema.partial().extend({
@@ -52,7 +66,21 @@ const vendorQuoteSchema = z.object({
   currency: z.string().optional().nullable(),
   quote_received_at: z.string().optional().nullable(),
   notes: z.string().optional().nullable(),
+  vendor_quote_number: z.string().optional().nullable(),
+  validity_date: z.string().optional().nullable(),
+  quote_file_url: z.string().max(2048).optional().nullable(),
+  quote_line_status: z.enum(['under_review', 'sent', 'finalised']).optional(),
 });
+
+const followupCreateSchema = z.object({
+  followup_date: z.string(),
+  method: z.enum(['Call', 'Email', 'Meeting']),
+  customer_response: z.string().optional().nullable(),
+  next_followup_date: z.string().optional().nullable(),
+  reminder_status: z.enum(['completed', 'pending', 'not_set']).optional(),
+});
+
+const followupUpdateSchema = followupCreateSchema.partial();
 
 const revisionSchema = z.object({
   revised_price: z.number(),
@@ -236,6 +264,126 @@ router.get('/stats', async (req, res) => {
   }
 });
 
+// GET /api/quotations/:id/followups
+router.get('/:id/followups', async (req, res) => {
+  const { id } = req.params;
+  const { data: exists } = await supabase.from('quotations').select('id').eq('id', id).maybeSingle();
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+
+  const { data: rows, error } = await supabase
+    .from('quotation_followups')
+    .select('*')
+    .eq('quotation_id', id)
+    .order('followup_date', { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  const creatorIds = Array.from(new Set((rows || []).map((r: any) => r.created_by).filter(Boolean)));
+  const { data: creators } = creatorIds.length
+    ? await supabase.from('users').select('id, full_name').in('id', creatorIds)
+    : { data: [] as any[] };
+
+  const byCreator = new Map((creators || []).map((u: any) => [u.id, u]));
+
+  res.json({
+    data: (rows || []).map((r: any) => ({
+      ...r,
+      users: r.created_by ? byCreator.get(r.created_by) || null : null,
+    })),
+  });
+});
+
+// POST /api/quotations/:id/followups
+router.post('/:id/followups', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+  const { data: exists } = await supabase.from('quotations').select('quotation_number').eq('id', id).maybeSingle();
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+
+  const parsed = followupCreateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+
+  const { data, error } = await supabase
+    .from('quotation_followups')
+    .insert({
+      quotation_id: id,
+      followup_date: parsed.data.followup_date,
+      method: parsed.data.method,
+      customer_response: parsed.data.customer_response ?? null,
+      next_followup_date: parsed.data.next_followup_date ?? null,
+      reminder_status: parsed.data.reminder_status ?? 'not_set',
+      created_by: userId,
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  await logActivity(userId, `added follow-up on ${exists.quotation_number}`, id, { followup_id: data.id });
+
+  res.status(201).json(data);
+});
+
+// PUT /api/quotations/followups/:followupId
+router.put('/followups/:followupId', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const parsed = followupUpdateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+
+  const clean: Record<string, unknown> = { ...parsed.data };
+  for (const k of Object.keys(clean)) {
+    if (clean[k] === '') clean[k] = null;
+  }
+
+  const { data, error } = await supabase
+    .from('quotation_followups')
+    .update(clean)
+    .eq('id', req.params.followupId)
+    .select()
+    .single();
+
+  if (error || !data) return res.status(404).json({ error: 'Not found' });
+
+  const { data: q } = await supabase.from('quotations').select('quotation_number').eq('id', data.quotation_id).maybeSingle();
+  if (q?.quotation_number) {
+    await logActivity(userId, `updated follow-up on ${q.quotation_number}`, data.quotation_id, { followup_id: data.id });
+  }
+
+  res.json(data);
+});
+
+// DELETE /api/quotations/followups/:followupId
+router.delete('/followups/:followupId', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+  const role = req.user?.role;
+
+  const { data: row, error: fErr } = await supabase
+    .from('quotation_followups')
+    .select('id, created_by, quotation_id')
+    .eq('id', req.params.followupId)
+    .maybeSingle();
+
+  if (fErr) return res.status(500).json({ error: fErr.message });
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (role !== 'super_admin' && row.created_by !== userId) return res.status(403).json({ error: 'Forbidden' });
+
+  const { data: q } = await supabase.from('quotations').select('quotation_number').eq('id', row.quotation_id).maybeSingle();
+
+  const { error } = await supabase.from('quotation_followups').delete().eq('id', row.id);
+  if (error) return res.status(500).json({ error: error.message });
+
+  if (q?.quotation_number) {
+    await logActivity(userId, `deleted follow-up on ${q.quotation_number}`, row.quotation_id, { followup_id: row.id });
+  }
+
+  res.json({ success: true });
+});
+
 // GET /api/quotations/:id
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
@@ -249,7 +397,7 @@ router.get('/:id', async (req, res) => {
   if (qErr) return res.status(500).json({ error: qErr.message });
   if (!quotation) return res.status(404).json({ error: 'Not found' });
 
-  const [vendorQuotes, revisions, leadUser, project] = await Promise.all([
+  const [vendorQuotes, revisions, leadUser, project, followupsRaw, updatedByUser] = await Promise.all([
     supabase
       .from('quotation_vendor_quotes')
       .select('*, vendors:vendors!quotation_vendor_quotes_vendor_id_fkey(id, vendor_name)')
@@ -261,10 +409,22 @@ router.get('/:id', async (req, res) => {
       .eq('quotation_id', id)
       .order('revision_number', { ascending: false }),
     quotation.enquiry_lead
-      ? supabase.from('users').select('id, full_name, avatar_url').eq('id', quotation.enquiry_lead).maybeSingle()
+      ? supabase
+          .from('users')
+          .select('id, full_name, avatar_url, email, phone')
+          .eq('id', quotation.enquiry_lead)
+          .maybeSingle()
       : Promise.resolve({ data: null as any, error: null as any }),
     quotation.project_id
       ? supabase.from('projects').select('id, project_name').eq('id', quotation.project_id).maybeSingle()
+      : Promise.resolve({ data: null as any, error: null as any }),
+    supabase
+      .from('quotation_followups')
+      .select('*')
+      .eq('quotation_id', id)
+      .order('followup_date', { ascending: false }),
+    (quotation as any).updated_by
+      ? supabase.from('users').select('id, full_name, email').eq('id', (quotation as any).updated_by).maybeSingle()
       : Promise.resolve({ data: null as any, error: null as any }),
   ]);
 
@@ -272,6 +432,19 @@ router.get('/:id', async (req, res) => {
   if (revisions.error) return res.status(500).json({ error: revisions.error.message });
   if (leadUser.error) return res.status(500).json({ error: leadUser.error.message });
   if (project.error) return res.status(500).json({ error: project.error.message });
+  if (followupsRaw.error) return res.status(500).json({ error: followupsRaw.error.message });
+  if (updatedByUser.error) return res.status(500).json({ error: updatedByUser.error.message });
+
+  const followRows = followupsRaw.data || [];
+  const creatorIds = Array.from(new Set(followRows.map((r: any) => r.created_by).filter(Boolean)));
+  const { data: creators } = creatorIds.length
+    ? await supabase.from('users').select('id, full_name').in('id', creatorIds)
+    : { data: [] as any[] };
+  const byCreator = new Map((creators || []).map((u: any) => [u.id, u]));
+  const quotation_followups = followRows.map((r: any) => ({
+    ...r,
+    users: r.created_by ? byCreator.get(r.created_by) || null : null,
+  }));
 
   res.json({
     ...quotation,
@@ -279,6 +452,8 @@ router.get('/:id', async (req, res) => {
     projects: project.data || null,
     quotation_vendor_quotes: vendorQuotes.data || [],
     quotation_revisions: revisions.data || [],
+    quotation_followups,
+    updated_by_user: updatedByUser.data || null,
   });
 });
 
@@ -324,7 +499,7 @@ router.put('/:id', async (req, res) => {
 
   const { data, error } = await supabase
     .from('quotations')
-    .update(parsed.data)
+    .update({ ...parsed.data, updated_by: userId })
     .eq('id', req.params.id)
     .select()
     .single();
@@ -363,9 +538,11 @@ router.post('/:id/vendor-quotes', async (req, res) => {
   const parsed = vendorQuoteSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
 
+  const insertPayload = { ...parsed.data, quote_file_url: parsed.data.quote_file_url || null };
+
   const { data, error } = await supabase
     .from('quotation_vendor_quotes')
-    .insert({ quotation_id: req.params.id, ...parsed.data })
+    .insert({ quotation_id: req.params.id, ...insertPayload })
     .select()
     .single();
 
@@ -384,9 +561,12 @@ router.put('/vendor-quotes/:quoteId', async (req, res) => {
   const parsed = vendorQuoteSchema.partial().safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
 
+  const updatePayload = { ...parsed.data } as Record<string, unknown>;
+  if (updatePayload.quote_file_url === '') updatePayload.quote_file_url = null;
+
   const { data, error } = await supabase
     .from('quotation_vendor_quotes')
-    .update(parsed.data)
+    .update(updatePayload)
     .eq('id', req.params.quoteId)
     .select()
     .single();
@@ -430,7 +610,7 @@ router.post('/:id/choose-vendor-quote', async (req, res) => {
   // Choose selected
   const { data: chosen, error: chooseErr } = await supabase
     .from('quotation_vendor_quotes')
-    .update({ is_chosen: true })
+    .update({ is_chosen: true, quote_line_status: 'finalised' })
     .eq('id', quoteId)
     .eq('quotation_id', quotationId)
     .select()
