@@ -25,7 +25,8 @@ const enquiryStage = z.enum([
   'preparing',
   'quote_sent',
   'follow_up',
-  'won_lost_closed',
+  'won_closed',
+  'lost_closed',
 ]);
 
 const createQuotationSchema = z.object({
@@ -78,6 +79,7 @@ const followupCreateSchema = z.object({
   customer_response: z.string().optional().nullable(),
   next_followup_date: z.string().optional().nullable(),
   reminder_status: z.enum(['completed', 'pending', 'not_set']).optional(),
+  vendor_quote_id: z.string().uuid().optional().nullable(),
 });
 
 const followupUpdateSchema = followupCreateSchema.partial();
@@ -107,12 +109,17 @@ async function logActivity(userId: string, action: string, recordId?: string, de
   });
 }
 
+function sanitizeIlikeSearch(raw: unknown) {
+  if (typeof raw !== 'string') return '';
+  return raw.replace(/[,%()]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
 // GET /api/quotations
 router.get('/', async (req, res) => {
   try {
     const userId = req.user?.id;
     const role = req.user?.role || 'employee';
-    const { status, project_id, enquiry_lead, search, page = '1', limit = '20' } = req.query;
+    const { status, project_id, enquiry_lead, search, from_deadline, to_deadline, page = '1', limit = '20' } = req.query;
 
     const p = Math.max(1, Number(page));
     const l = Math.min(100, Number(limit));
@@ -124,9 +131,15 @@ router.get('/', async (req, res) => {
     if (status) query = query.eq('status', status as string);
     if (project_id) query = query.eq('project_id', project_id as string);
     if (enquiry_lead) query = query.eq('enquiry_lead', enquiry_lead as string);
+    if (from_deadline) query = query.gte('deadline', String(from_deadline));
+    if (to_deadline) query = query.lte('deadline', String(to_deadline));
     if (search) {
-      const s = String(search);
-      query = query.or(`quotation_number.ilike.%${s}%,requirement.ilike.%${s}%`);
+      const s = sanitizeIlikeSearch(search);
+      if (s) {
+        query = query.or(
+          `quotation_number.ilike.%${s}%,requirement.ilike.%${s}%,enquiry_title.ilike.%${s}%,standalone_project_name.ilike.%${s}%`,
+        );
+      }
     }
 
     // UI/permission guard: employees can only see their own lead or linked project assignments
@@ -267,14 +280,21 @@ router.get('/stats', async (req, res) => {
 // GET /api/quotations/:id/followups
 router.get('/:id/followups', async (req, res) => {
   const { id } = req.params;
+  const vendorQuoteId = typeof req.query.vendor_quote_id === 'string' ? req.query.vendor_quote_id : null;
   const { data: exists } = await supabase.from('quotations').select('id').eq('id', id).maybeSingle();
   if (!exists) return res.status(404).json({ error: 'Not found' });
 
-  const { data: rows, error } = await supabase
+  let query = supabase
     .from('quotation_followups')
     .select('*')
     .eq('quotation_id', id)
     .order('followup_date', { ascending: false });
+
+  if (vendorQuoteId) {
+    query = query.eq('vendor_quote_id', vendorQuoteId);
+  }
+
+  const { data: rows, error } = await query;
 
   if (error) return res.status(500).json({ error: error.message });
 
@@ -305,10 +325,23 @@ router.post('/:id/followups', async (req, res) => {
   const parsed = followupCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
 
+  if (parsed.data.vendor_quote_id) {
+    const { data: vendorQuote, error: vendorQuoteError } = await supabase
+      .from('quotation_vendor_quotes')
+      .select('id')
+      .eq('id', parsed.data.vendor_quote_id)
+      .eq('quotation_id', id)
+      .maybeSingle();
+
+    if (vendorQuoteError) return res.status(500).json({ error: vendorQuoteError.message });
+    if (!vendorQuote) return res.status(400).json({ error: 'Invalid vendor quote for this enquiry' });
+  }
+
   const { data, error } = await supabase
     .from('quotation_followups')
     .insert({
       quotation_id: id,
+      vendor_quote_id: parsed.data.vendor_quote_id ?? null,
       followup_date: parsed.data.followup_date,
       method: parsed.data.method,
       customer_response: parsed.data.customer_response ?? null,
