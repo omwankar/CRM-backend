@@ -2,6 +2,7 @@ import express from 'express';
 import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
+import { sharedWriteGuard } from '../middleware/requireRole.js';
 
 const router = express.Router();
 
@@ -11,6 +12,8 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 router.use(authMiddleware);
+// Plain `user` role can read but not mutate company-wide data.
+router.use(sharedWriteGuard);
 
 // Validation schemas
 const createProjectSchema = z.object({

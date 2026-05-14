@@ -3,11 +3,13 @@ import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
+import { sharedWriteGuard } from '../middleware/requireRole.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
 router.use(authMiddleware);
+router.use(sharedWriteGuard);
 router.use(auditLog);
 
 const quotationStatus = z.enum([

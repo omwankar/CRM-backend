@@ -19,18 +19,48 @@ function requireSuperAdmin(req: express.Request, res: express.Response): boolean
   return true;
 }
 
+// Role values that an admin can ASSIGN via the UI. Note `super_admin` is
+// intentionally absent - it can only be granted directly in the database.
+const assignableRole = z.enum(['manager', 'user']);
+
 const inviteSchema = z.object({
   email: z.string().email(),
   full_name: z.string().min(2).max(100),
-  role: z.enum(['admin', 'manager', 'operations', 'sales']),
+  role: assignableRole,
   department: z.string().optional(),
   phone: z.string().optional(),
 });
 
+// "Create user instantly" - super_admin adds a user with a password and the
+// account is ready to log in. No email confirmation, no invite link.
+const createSchema = z.object({
+  email: z.string().email(),
+  full_name: z.string().min(2).max(100),
+  role: assignableRole,
+  // If omitted, the server generates one and returns it in the response so
+  // the super_admin can share the credentials manually.
+  password: z.string().min(8).max(128).optional(),
+  department: z.string().optional(),
+  phone: z.string().optional(),
+});
+
+/**
+ * Generate a reasonably strong random password: 16 chars from the URL-safe
+ * base64 alphabet plus a guaranteed digit and symbol.
+ */
+function generatePassword(): string {
+  // 12 random base64 chars + a digit + a symbol = >= 14 chars, mixed classes.
+  const random = (Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)).slice(0, 12);
+  const digit = Math.floor(Math.random() * 10).toString();
+  const symbols = '!@#$%^&*';
+  const symbol = symbols[Math.floor(Math.random() * symbols.length)];
+  return `${random}${digit}${symbol}`;
+}
+
 const updateSchema = z.object({
   full_name: z.string().optional(),
   phone: z.string().optional(),
-  role: z.enum(['admin', 'manager', 'operations', 'sales']).optional(),
+  role: assignableRole.optional(),
   department: z.string().optional(),
   is_active: z.boolean().optional(),
 });
@@ -86,6 +116,91 @@ router.get('/debug/me', async (req, res) => {
     fromDatabase: dbUser,
     databaseError: dbError,
     timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * POST / — instantly create a user (super_admin only).
+ *
+ * Uses Supabase Auth admin API with `email_confirm: true`, so the account
+ * is ready to sign in immediately - no confirmation email, no invite link.
+ * If no password is supplied, one is generated and returned in the response.
+ */
+router.post('/', async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+
+  const parsed = createSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+  }
+
+  const { email, full_name, role, department, phone } = parsed.data;
+  const password = parsed.data.password || generatePassword();
+  const passwordWasGenerated = !parsed.data.password;
+
+  // 1) Create the auth user with email already confirmed.
+  const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: { full_name, role },
+  });
+
+  if (authError) {
+    // Common case: user with that email already exists in auth.users.
+    return res.status(400).json({ error: authError.message });
+  }
+  const newUserId = authData.user?.id;
+  if (!newUserId) {
+    return res.status(500).json({ error: 'Failed to create auth user' });
+  }
+
+  // 2) Upsert the public.users profile row. The `handle_new_user` trigger
+  // usually creates it with role='user' - we overwrite with the right role
+  // and the other fields supplied by the admin.
+  const { data: userData, error: insertError } = await supabase
+    .from('users')
+    .upsert(
+      {
+        id: newUserId,
+        email,
+        full_name,
+        role,
+        department: department || null,
+        phone: phone || null,
+        is_active: true,
+        invited_by: req.user?.id,
+        invited_at: new Date().toISOString(),
+      },
+      { onConflict: 'id' },
+    )
+    .select()
+    .single();
+
+  if (insertError) {
+    // Auth user is orphaned at this point - best-effort cleanup.
+    await supabase.auth.admin.deleteUser(newUserId).catch(() => {});
+    return res.status(500).json({ error: insertError.message });
+  }
+
+  // 3) Activity log
+  await supabase.from('activity_logs').insert({
+    action: 'user_created_direct',
+    user_id: req.user?.id,
+    record_id: newUserId,
+    details: { email, full_name, role },
+  });
+
+  // 4) Return credentials so the super_admin can share them with the new user.
+  // The generated password is the ONLY time it's ever returned in plaintext.
+  res.status(201).json({
+    user: userData,
+    credentials: {
+      email,
+      password,
+      password_was_generated: passwordWasGenerated,
+    },
+    message: `User ${email} created. They can sign in now.`,
   });
 });
 

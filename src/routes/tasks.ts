@@ -2,6 +2,7 @@ import express from 'express';
 import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
+import { taskWriteGuard } from '../middleware/requireRole.js';
 
 const router = express.Router();
 
@@ -11,6 +12,9 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 router.use(authMiddleware);
+// Tasks are read-public, write-restricted: managers/super_admin always; a
+// plain `user` may modify only tasks they are assigned to / supervise / created.
+router.use(taskWriteGuard);
 
 // Validation schemas
 const createTaskSchema = z.object({
