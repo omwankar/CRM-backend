@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../../middleware/auth.js";
 import { auditLog } from "../../middleware/auditLog.js";
-import { requireManager } from "../../middleware/requireRole.js";
+import { requireHrAccess, requireManager } from "../../middleware/requireRole.js";
 
 const router = express.Router();
 const supabase = createClient(
@@ -12,12 +12,19 @@ const supabase = createClient(
 );
 
 router.use(authMiddleware);
+
+// Approve/reject only — submit/list moved to /api/clock/leave-requests
+router.use((req, res, next) => {
+  if (req.method === "PATCH") return next();
+  return requireHrAccess(req, res, next);
+});
 router.use(auditLog);
 
 const submitSchema = z.object({
   start_date: z.string(),
   end_date: z.string(),
   reason: z.string().optional(),
+  leave_type: z.enum(["paid", "unpaid", "lop"]).default("unpaid"),
 });
 
 const decisionSchema = z.object({
@@ -144,13 +151,21 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: "End date must be on or after start date" });
   }
 
+  const { data: profile } = await supabase
+    .from("users")
+    .select("employee_id")
+    .eq("id", userId)
+    .maybeSingle();
+
   const { data, error } = await supabase
     .from("leave_requests")
     .insert({
       requested_by: userId,
+      employee_id: profile?.employee_id || null,
       start_date: parsed.data.start_date,
       end_date: parsed.data.end_date,
       reason: parsed.data.reason,
+      leave_type: parsed.data.leave_type,
       status: "pending",
     })
     .select()

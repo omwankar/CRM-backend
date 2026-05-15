@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../../middleware/auth.js";
 import { auditLog } from "../../middleware/auditLog.js";
-import { sharedWriteGuard } from "../../middleware/requireRole.js";
+import { requireHrAccess } from "../../middleware/requireRole.js";
 
 const router = express.Router();
 const supabase = createClient(
@@ -12,7 +12,7 @@ const supabase = createClient(
 );
 
 router.use(authMiddleware);
-router.use(sharedWriteGuard);
+router.use(requireHrAccess);
 router.use(auditLog);
 
 const schema = z.object({

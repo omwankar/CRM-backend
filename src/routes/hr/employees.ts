@@ -3,7 +3,8 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../../middleware/auth.js";
 import { auditLog } from "../../middleware/auditLog.js";
-import { sharedWriteGuard } from "../../middleware/requireRole.js";
+import { requireHrAccess } from "../../middleware/requireRole.js";
+import { isValidEmployeeId } from "../../utils/employeeId.js";
 
 const router = express.Router();
 const supabase = createClient(
@@ -16,21 +17,22 @@ const hrFields = z.object({
   designation: z.string().optional().nullable(),
   department: z.string().optional().nullable(),
   joining_date: z.string().optional().nullable(),
-  employment_status: z.enum(["active", "on_leave", "terminated"]).optional(),
+  employment_type: z.enum(["full_time", "part_time", "probation", "commission"]).optional().nullable(),
+  work_mode: z.enum(["office", "remote"]).optional().nullable(),
   reporting_manager_id: z.string().uuid().optional().nullable(),
   phone: z.string().optional().nullable(),
   full_name: z.string().optional(),
 });
 
 router.use(authMiddleware);
-router.use(sharedWriteGuard);
+router.use(requireHrAccess);
 router.use(auditLog);
 
 const employeeSelect =
-  "id, email, full_name, phone, role, department, employee_id, designation, joining_date, employment_status, reporting_manager_id, is_active, avatar_url, last_login, created_at";
+  "id, email, full_name, phone, role, department, employee_id, designation, joining_date, employment_type, work_mode, reporting_manager_id, is_active, avatar_url, last_login, created_at";
 
 router.get("/", async (req, res) => {
-  const { search, department, designation, employment_status, page = "1", limit = "50" } =
+  const { search, department, designation, employment_type, work_mode, page = "1", limit = "50" } =
     req.query;
 
   let query = supabase
@@ -40,7 +42,8 @@ router.get("/", async (req, res) => {
 
   if (department) query = query.eq("department", department as string);
   if (designation) query = query.ilike("designation", `%${designation}%`);
-  if (employment_status) query = query.eq("employment_status", employment_status as string);
+  if (employment_type) query = query.eq("employment_type", employment_type as string);
+  if (work_mode) query = query.eq("work_mode", work_mode as string);
   if (search) {
     const s = String(search);
     query = query.or(
@@ -52,7 +55,7 @@ router.get("/", async (req, res) => {
   const l = Math.min(100, Number(limit));
   query = query
     .range((p - 1) * l, p * l - 1)
-    .order("full_name", { ascending: true });
+    .order("employee_id", { ascending: true });
 
   const { data, count, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
@@ -106,7 +109,7 @@ router.get("/:id", async (req, res) => {
   if (data.reporting_manager_id) {
     const { data: mgr } = await supabase
       .from("users")
-      .select("id, full_name, email")
+      .select("id, full_name, email, employee_id")
       .eq("id", data.reporting_manager_id)
       .maybeSingle();
     reporting_manager = mgr;
@@ -121,9 +124,29 @@ router.put("/:id", async (req, res) => {
     return res.status(400).json({ error: "Validation failed", issues: parsed.error.issues });
   }
 
+  const payload = { ...parsed.data, updated_at: new Date().toISOString() };
+
+  if (payload.employee_id != null && payload.employee_id !== "") {
+    if (!isValidEmployeeId(payload.employee_id)) {
+      return res.status(400).json({ error: "Employee ID must be alphanumeric (letters and numbers only)" });
+    }
+    if (req.user?.role !== "super_admin") {
+      return res.status(403).json({ error: "Only super admin can change employee ID" });
+    }
+    const { data: dup } = await supabase
+      .from("users")
+      .select("id")
+      .eq("employee_id", payload.employee_id)
+      .neq("id", req.params.id)
+      .maybeSingle();
+    if (dup) return res.status(400).json({ error: "Employee ID already in use" });
+  } else if (req.user?.role !== "super_admin") {
+    delete payload.employee_id;
+  }
+
   const { data, error } = await supabase
     .from("users")
-    .update({ ...parsed.data, updated_at: new Date().toISOString() })
+    .update(payload)
     .eq("id", req.params.id)
     .select(employeeSelect)
     .single();

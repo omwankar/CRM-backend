@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../../middleware/auth.js";
 import { auditLog } from "../../middleware/auditLog.js";
-import { sharedWriteGuard } from "../../middleware/requireRole.js";
+import { requireHrAccess } from "../../middleware/requireRole.js";
 
 const router = express.Router();
 const supabase = createClient(
@@ -15,12 +15,13 @@ const schema = z.object({
   date: z.string(),
   title: z.string().min(1),
   description: z.string().optional(),
+  holiday_pay_type: z.enum(["paid", "unpaid"]).default("paid"),
 });
 
 const updateSchema = schema.partial();
 
 router.use(authMiddleware);
-router.use(sharedWriteGuard);
+router.use(requireHrAccess);
 router.use(auditLog);
 
 router.get("/", async (req, res) => {
@@ -65,7 +66,10 @@ router.post("/", async (req, res) => {
   const { data, error } = await supabase
     .from("calendar_events")
     .insert({
-      ...parsed.data,
+      date: parsed.data.date,
+      title: parsed.data.title,
+      description: parsed.data.description,
+      holiday_pay_type: parsed.data.holiday_pay_type,
       event_type: "holiday",
       created_by: userId,
     })

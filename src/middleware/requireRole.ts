@@ -56,6 +56,9 @@ export const requireManager: RequestHandler = requireRole("manager", "super_admi
 /** Only super_admin: user invites, role changes, deactivation. */
 export const requireSuperAdmin: RequestHandler = requireRole("super_admin");
 
+/** HR portal: manager and super_admin only (all verbs including GET). */
+export const requireHrAccess: RequestHandler = requireRole("manager", "super_admin");
+
 /**
  * Composite guard for "shared" modules (projects, customers, vendors, …):
  *

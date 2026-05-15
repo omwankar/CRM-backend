@@ -24,6 +24,75 @@ const missedPunchSchema = z.object({
   reason: z.string().optional(),
 });
 
+const leaveSubmitSchema = z.object({
+  start_date: z.string(),
+  end_date: z.string(),
+  reason: z.string().optional(),
+  leave_type: z.enum(['paid', 'unpaid', 'lop']).default('unpaid'),
+});
+
+async function notifyLeave(userId: string, title: string, message: string) {
+  await supabase.from('notifications').insert({
+    user_id: userId,
+    type: 'leave',
+    title,
+    message,
+  });
+}
+
+// GET /leave-requests — current user's leave requests
+router.get('/leave-requests', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data, error } = await supabase
+    .from('leave_requests')
+    .select('id, start_date, end_date, reason, leave_type, status, reviewed_at, created_at')
+    .eq('requested_by', userId)
+    .order('created_at', { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data: data || [] });
+});
+
+// POST /leave-requests — submit leave (all authenticated users)
+router.post('/leave-requests', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const parsed = leaveSubmitSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+  }
+
+  if (parsed.data.end_date < parsed.data.start_date) {
+    return res.status(400).json({ error: 'End date must be on or after start date' });
+  }
+
+  const { data: profile } = await supabase
+    .from('users')
+    .select('employee_id')
+    .eq('id', userId)
+    .maybeSingle();
+
+  const { data, error } = await supabase
+    .from('leave_requests')
+    .insert({
+      requested_by: userId,
+      employee_id: profile?.employee_id || null,
+      start_date: parsed.data.start_date,
+      end_date: parsed.data.end_date,
+      reason: parsed.data.reason,
+      leave_type: parsed.data.leave_type,
+      status: 'pending',
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
 // GET /sessions — list current user's sessions
 router.get('/sessions', async (req, res) => {
   const userId = req.user?.id;

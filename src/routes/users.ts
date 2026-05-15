@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
+import { generateNextEmployeeId, isValidEmployeeId } from '../utils/employeeId.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -37,11 +38,12 @@ const createSchema = z.object({
   email: z.string().email(),
   full_name: z.string().min(2).max(100),
   role: assignableRole,
-  // If omitted, the server generates one and returns it in the response so
-  // the super_admin can share the credentials manually.
   password: z.string().min(8).max(128).optional(),
   department: z.string().optional(),
   phone: z.string().optional(),
+  employee_id: z.string().optional(),
+  employment_type: z.enum(['full_time', 'part_time', 'probation', 'commission']).optional(),
+  work_mode: z.enum(['office', 'remote']).optional(),
 });
 
 /**
@@ -134,9 +136,20 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
   }
 
-  const { email, full_name, role, department, phone } = parsed.data;
+  const { email, full_name, role, department, phone, employment_type, work_mode } = parsed.data;
   const password = parsed.data.password || generatePassword();
   const passwordWasGenerated = !parsed.data.password;
+
+  let employeeId = parsed.data.employee_id?.trim() || '';
+  if (employeeId && !isValidEmployeeId(employeeId)) {
+    return res.status(400).json({ error: 'Employee ID must be alphanumeric (letters and numbers only)' });
+  }
+  if (!employeeId) {
+    employeeId = await generateNextEmployeeId(supabase);
+  } else {
+    const { data: dup } = await supabase.from('users').select('id').eq('employee_id', employeeId).maybeSingle();
+    if (dup) return res.status(400).json({ error: 'Employee ID already in use' });
+  }
 
   // 1) Create the auth user with email already confirmed.
   const { data: authData, error: authError } = await supabase.auth.admin.createUser({
@@ -168,6 +181,9 @@ router.post('/', async (req, res) => {
         role,
         department: department || null,
         phone: phone || null,
+        employee_id: employeeId,
+        employment_type: employment_type || 'full_time',
+        work_mode: work_mode || 'office',
         is_active: true,
         invited_by: req.user?.id,
         invited_at: new Date().toISOString(),
@@ -178,29 +194,26 @@ router.post('/', async (req, res) => {
     .single();
 
   if (insertError) {
-    // Auth user is orphaned at this point - best-effort cleanup.
     await supabase.auth.admin.deleteUser(newUserId).catch(() => {});
     return res.status(500).json({ error: insertError.message });
   }
 
-  // 3) Activity log
   await supabase.from('activity_logs').insert({
     action: 'user_created_direct',
     user_id: req.user?.id,
     record_id: newUserId,
-    details: { email, full_name, role },
+    details: { email, full_name, role, employee_id: employeeId },
   });
 
-  // 4) Return credentials so the super_admin can share them with the new user.
-  // The generated password is the ONLY time it's ever returned in plaintext.
   res.status(201).json({
     user: userData,
     credentials: {
       email,
+      employee_id: employeeId,
       password,
       password_was_generated: passwordWasGenerated,
     },
-    message: `User ${email} created. They can sign in now.`,
+    message: `User ${email} (${employeeId}) created. They can sign in with Employee ID or email.`,
   });
 });
 
