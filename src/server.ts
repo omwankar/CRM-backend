@@ -22,6 +22,7 @@ import { registerUserRoutes } from "./routes/users.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerCommentRoutes } from "./routes/comments.js";
 import { registerQuotationRoutes } from "./routes/quotations.js";
+import { registerHrRoutes } from "./routes/hr/index.js";
 
 const env = loadEnv();
 
@@ -55,6 +56,7 @@ registerUserRoutes(api);
 registerTaskRoutes(api);
 registerCommentRoutes(api);
 registerQuotationRoutes(api);
+registerHrRoutes(api);
 app.use("/api", api);
 
 app.listen(env.PORT, () => {
