@@ -17,6 +17,19 @@ function sessionHours(clockIn: string, clockOut: string | null): number {
   return (new Date(clockOut).getTime() - new Date(clockIn).getTime()) / 3600000;
 }
 
+function dateInRange(dateStr: string, start: string, end: string): boolean {
+  return dateStr >= start && dateStr <= end;
+}
+
+function daysInMonth(year: number, month: number): string[] {
+  const last = new Date(year, month, 0).getDate();
+  const out: string[] = [];
+  for (let d = 1; d <= last; d++) {
+    out.push(`${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
+  }
+  return out;
+}
+
 function countLeaveDaysInMonth(startDate: string, endDate: string, year: number, month: number): number {
   const monthStart = new Date(year, month - 1, 1);
   const monthEnd = new Date(year, month, 0);
@@ -156,6 +169,157 @@ router.get("/team", async (req, res) => {
       };
     }),
     holidays: holidaysRes.data || [],
+  });
+});
+
+/** Day-wise attendance for one employee in a month. */
+router.get("/employee/:userId", async (req, res) => {
+  const userId = req.params.userId;
+  const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+  const [year, mon] = month.split("-").map(Number);
+  const monthStartStr = `${year}-${String(mon).padStart(2, "0")}-01`;
+  const monthEndStr = new Date(year, mon, 0).toISOString().slice(0, 10);
+  const startIso = new Date(year, mon - 1, 1).toISOString();
+  const endIso = new Date(year, mon, 0, 23, 59, 59).toISOString();
+
+  const { data: user, error: userErr } = await supabase
+    .from("users")
+    .select(
+      "id, full_name, email, department, employee_id, designation, employment_type, work_mode, monthly_salary, reporting_manager_id",
+    )
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (userErr) return res.status(500).json({ error: userErr.message });
+  if (!user) return res.status(404).json({ error: "Employee not found" });
+
+  const [sessionsRes, leavesRes, holidaysRes] = await Promise.all([
+    supabase
+      .from("clock_sessions")
+      .select("id, clock_in, clock_out, notes")
+      .eq("user_id", userId)
+      .gte("clock_in", startIso)
+      .lte("clock_in", endIso)
+      .order("clock_in", { ascending: true }),
+    supabase
+      .from("leave_requests")
+      .select("*")
+      .eq("requested_by", userId)
+      .lte("start_date", monthEndStr)
+      .gte("end_date", monthStartStr),
+    supabase
+      .from("calendar_events")
+      .select("id, date, title, holiday_pay_type")
+      .eq("event_type", "holiday")
+      .gte("date", monthStartStr)
+      .lte("date", monthEndStr),
+  ]);
+
+  if (sessionsRes.error) return res.status(500).json({ error: sessionsRes.error.message });
+  if (leavesRes.error) return res.status(500).json({ error: leavesRes.error.message });
+
+  const sessions = sessionsRes.data || [];
+  const leaves = leavesRes.data || [];
+  const holidays = holidaysRes.data || [];
+
+  const sessionsByDate: Record<string, typeof sessions> = {};
+  for (const s of sessions) {
+    const d = s.clock_in.slice(0, 10);
+    if (!sessionsByDate[d]) sessionsByDate[d] = [];
+    sessionsByDate[d].push(s);
+  }
+
+  let totalHours = 0;
+  let daysPresent = 0;
+  let paidLeaveDays = 0;
+  let unpaidLeaveDays = 0;
+  let lopDays = 0;
+
+  const days = daysInMonth(year, mon).map((dateStr) => {
+    const daySessions = sessionsByDate[dateStr] || [];
+    const hours =
+      Math.round(
+        daySessions.reduce((acc, s) => acc + sessionHours(s.clock_in, s.clock_out), 0) * 100,
+      ) / 100;
+
+    const holiday = holidays.find((h) => h.date === dateStr) || null;
+    const leave = leaves.find((l) => dateInRange(dateStr, l.start_date, l.end_date)) || null;
+
+    const markers: string[] = [];
+    if (holiday) {
+      markers.push(holiday.holiday_pay_type === "unpaid" ? "unpaid_holiday" : "paid_holiday");
+    }
+    if (leave) {
+      if (leave.status === "approved") {
+        if (leave.leave_type === "paid") {
+          markers.push("paid_leave");
+          paidLeaveDays++;
+        } else if (leave.leave_type === "lop") {
+          markers.push("lop");
+          lopDays++;
+        } else {
+          markers.push("unpaid_leave");
+          unpaidLeaveDays++;
+        }
+      } else if (leave.status === "pending") {
+        markers.push(`pending_${leave.leave_type}`);
+      } else if (leave.status === "rejected") {
+        markers.push("leave_rejected");
+      }
+    }
+    if (daySessions.length > 0) {
+      markers.push("present");
+      totalHours += hours;
+      daysPresent++;
+    }
+    if (markers.length === 0) {
+      markers.push("absent");
+    }
+
+    return {
+      date: dateStr,
+      weekday: new Date(`${dateStr}T12:00:00`).toLocaleDateString("en-US", { weekday: "short" }),
+      markers,
+      hours,
+      sessions: daySessions.map((s) => ({
+        id: s.id,
+        clock_in: s.clock_in,
+        clock_out: s.clock_out,
+        notes: s.notes,
+      })),
+      holiday: holiday
+        ? {
+            id: holiday.id,
+            title: holiday.title,
+            holiday_pay_type: holiday.holiday_pay_type || "paid",
+          }
+        : null,
+      leave: leave
+        ? {
+            id: leave.id,
+            leave_type: leave.leave_type,
+            status: leave.status,
+            start_date: leave.start_date,
+            end_date: leave.end_date,
+            reason: leave.reason,
+          }
+        : null,
+    };
+  });
+
+  res.json({
+    month,
+    employee: user,
+    days,
+    summary: {
+      total_hours: Math.round(totalHours * 100) / 100,
+      days_present: daysPresent,
+      leave_paid_days: paidLeaveDays,
+      leave_unpaid_days: unpaidLeaveDays,
+      leave_lop_days: lopDays,
+      holiday_count: holidays.length,
+    },
+    holidays,
   });
 });
 

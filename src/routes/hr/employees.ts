@@ -22,6 +22,7 @@ const hrFields = z.object({
   reporting_manager_id: z.string().uuid().optional().nullable(),
   phone: z.string().optional().nullable(),
   full_name: z.string().optional(),
+  monthly_salary: z.number().min(0).optional().nullable(),
 });
 
 router.use(authMiddleware);
@@ -29,7 +30,7 @@ router.use(requireHrAccess);
 router.use(auditLog);
 
 const employeeSelect =
-  "id, email, full_name, phone, role, department, employee_id, designation, joining_date, employment_type, work_mode, reporting_manager_id, is_active, avatar_url, last_login, created_at";
+  "id, email, full_name, phone, role, department, employee_id, designation, joining_date, employment_type, work_mode, monthly_salary, reporting_manager_id, is_active, avatar_url, last_login, created_at";
 
 router.get("/", async (req, res) => {
   const { search, department, designation, employment_type, work_mode, page = "1", limit = "50" } =
