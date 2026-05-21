@@ -12,6 +12,7 @@ import {
 } from "../utils/invoiceNumber.js";
 import { buildInvoicePdfBuffer, resolveInvoiceLogoPath, type InvoicePdfData } from "../services/invoicePdf.js";
 import { sendInvoiceEmail } from "../services/invoiceEmail.js";
+import { getQuotationCustomerPrice } from "../utils/quotationPricing.js";
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -50,6 +51,7 @@ const taxSchema = z.object({
 
 const createSchema = z.object({
   buyer_id: z.string().uuid(),
+  quotation_id: z.string().uuid().optional().nullable(),
   issue_date: z.string().optional(),
   due_date: z.string(),
   currency: z.string().min(3).max(3).default("INR"),
@@ -60,6 +62,12 @@ const createSchema = z.object({
   notes: z.string().optional().nullable(),
   terms: z.string().optional().nullable(),
   line_items: z.array(lineItemSchema).min(1),
+});
+
+const fromQuotationSchema = z.object({
+  buyer_id: z.string().uuid(),
+  due_date: z.string().optional(),
+  taxes: z.array(taxSchema).optional(),
 });
 
 const updateSchema = createSchema.partial().extend({
@@ -189,7 +197,17 @@ async function fetchInvoiceDetail(id: string) {
         ]
       : [];
 
-  return { ...invoice, line_items: lines || [], buyer: buyer || null, taxes: taxRows };
+  let quotation: Record<string, unknown> | null = null;
+  if (invoice.quotation_id) {
+    const { data: q } = await supabase
+      .from("quotations")
+      .select("id, quotation_number, requirement, enquiry_title, standalone_project_name")
+      .eq("id", invoice.quotation_id)
+      .maybeSingle();
+    quotation = q;
+  }
+
+  return { ...invoice, line_items: lines || [], buyer: buyer || null, taxes: taxRows, quotation };
 }
 
 async function buildPdfForInvoice(detail: NonNullable<Awaited<ReturnType<typeof fetchInvoiceDetail>>>) {
@@ -327,7 +345,7 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: "Validation failed", issues: parsed.error.issues });
   }
 
-  const { buyer_id, due_date, currency, notes, terms, line_items, reference } = parsed.data;
+  const { buyer_id, due_date, currency, notes, terms, line_items, reference, quotation_id } = parsed.data;
   const issue_date = parsed.data.issue_date || new Date().toISOString().slice(0, 10);
   const taxInputs = resolveTaxInputs(parsed.data);
   const discount = resolveDiscount(parsed.data);
@@ -346,11 +364,17 @@ router.post("/", async (req, res) => {
   const invoice_number = await generateNextInvoiceNumber(supabase);
   const userId = req.user?.id;
 
+  if (quotation_id) {
+    const { data: q } = await supabase.from("quotations").select("id").eq("id", quotation_id).maybeSingle();
+    if (!q) return res.status(400).json({ error: "Linked quotation not found" });
+  }
+
   const { data: invoice, error: invErr } = await supabase
     .from("invoices")
     .insert({
       invoice_number,
       buyer_id,
+      quotation_id: quotation_id ?? null,
       status: "draft",
       issue_date,
       due_date,
@@ -386,7 +410,121 @@ router.post("/", async (req, res) => {
     return res.status(500).json({ error: e instanceof Error ? e.message : "Failed to save taxes" });
   }
 
-  if (userId) await logActivity(userId, "invoice_created", invoice.id, { invoice_number });
+  if (userId) {
+    await logActivity(userId, "invoice_created", invoice.id, {
+      invoice_number,
+      quotation_id: quotation_id ?? undefined,
+    });
+  }
+  const detail = await fetchInvoiceDetail(invoice.id);
+  res.status(201).json(detail);
+});
+
+// POST /api/invoices/from-quotation/:quotationId — draft invoice prefilled from quote
+router.post("/from-quotation/:quotationId", async (req, res) => {
+  const parsed = fromQuotationSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validation failed", issues: parsed.error.issues });
+  }
+
+  const { data: quotation, error: qErr } = await supabase
+    .from("quotations")
+    .select("*")
+    .eq("id", req.params.quotationId)
+    .maybeSingle();
+
+  if (qErr) return res.status(500).json({ error: qErr.message });
+  if (!quotation) return res.status(404).json({ error: "Quotation not found" });
+
+  const price = getQuotationCustomerPrice(quotation);
+  if (!price) {
+    return res.status(400).json({
+      error: "Set a customer send price on the quotation before creating an invoice.",
+    });
+  }
+
+  const { data: buyer, error: buyerErr } = await supabase
+    .from("buyers")
+    .select("id")
+    .eq("id", parsed.data.buyer_id)
+    .is("deleted_at", null)
+    .maybeSingle();
+
+  if (buyerErr || !buyer) return res.status(400).json({ error: "Buyer not found" });
+
+  const due =
+    parsed.data.due_date ||
+    new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const issue_date = new Date().toISOString().slice(0, 10);
+  const currency = price.currency;
+  const defaultTaxes =
+    currency === "SAR"
+      ? [{ rate: 15, name: "15", tax_number: process.env.COMPANY_VAT_NUMBER?.trim() || null }]
+      : [];
+  const taxInputs = parsed.data.taxes?.length ? parsed.data.taxes : defaultTaxes;
+
+  const desc =
+    (quotation.requirement || "Quotation").slice(0, 500) ||
+    `Quotation ${quotation.quotation_number}`;
+  const line_items = [{ description: desc, quantity: 1, unit_price: price.amount }];
+  const mapped = mapLineItems(line_items);
+  const totals = computeInvoiceTotalsFromTaxes(mapped, taxInputs, null);
+  const invoice_number = await generateNextInvoiceNumber(supabase);
+  const userId = req.user?.id;
+
+  const notes = price.notes
+    ? `Linked to quotation ${quotation.quotation_number}. ${price.notes}`
+    : `Linked to quotation ${quotation.quotation_number}.`;
+
+  const { data: invoice, error: invErr } = await supabase
+    .from("invoices")
+    .insert({
+      invoice_number,
+      buyer_id: parsed.data.buyer_id,
+      quotation_id: quotation.id,
+      status: "draft",
+      issue_date,
+      due_date: due,
+      currency,
+      tax_rate: totals.tax_rate,
+      reference: quotation.quotation_number,
+      discount_type: null,
+      discount_value: 0,
+      discount_amount: 0,
+      notes,
+      terms: null,
+      created_by: userId,
+      subtotal: totals.subtotal,
+      tax_amount: totals.tax_amount,
+      total: totals.total,
+    })
+    .select()
+    .single();
+
+  if (invErr || !invoice) return res.status(500).json({ error: invErr?.message || "Failed to create invoice" });
+
+  const rows = mapped.map((l) => ({ ...l, invoice_id: invoice.id }));
+  const { error: linesErr } = await supabase.from("invoice_line_items").insert(rows);
+  if (linesErr) {
+    await supabase.from("invoices").delete().eq("id", invoice.id);
+    return res.status(500).json({ error: linesErr.message });
+  }
+
+  try {
+    await saveInvoiceTaxes(invoice.id, totals.taxes);
+  } catch (e) {
+    await supabase.from("invoices").delete().eq("id", invoice.id);
+    return res.status(500).json({ error: e instanceof Error ? e.message : "Failed to save taxes" });
+  }
+
+  if (userId) {
+    await logActivity(userId, "invoice_created_from_quotation", invoice.id, {
+      invoice_number,
+      quotation_id: quotation.id,
+      quotation_number: quotation.quotation_number,
+    });
+  }
+
   const detail = await fetchInvoiceDetail(invoice.id);
   res.status(201).json(detail);
 });

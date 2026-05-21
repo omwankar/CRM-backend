@@ -4,6 +4,10 @@ import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
 import { sharedWriteGuard } from '../middleware/requireRole.js';
+import { buildQuotationPdfBuffer, type QuotationPdfData } from '../services/quotationPdf.js';
+import { sendQuotationEmail } from '../services/quotationEmail.js';
+import { resolveInvoiceLogoPath } from '../services/invoicePdf.js';
+import { getQuotationCustomerPrice } from '../utils/quotationPricing.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -49,6 +53,8 @@ const createQuotationSchema = z.object({
 });
 
 const updateQuotationSchema = createQuotationSchema.partial().extend({
+  buyer_id: z.string().uuid().optional().nullable(),
+  client_email: z.string().email().optional().nullable(),
   chosen_quote_id: z.string().uuid().optional().nullable(),
   clarusto_final_price: z.number().optional().nullable(),
   clarusto_final_currency: z.string().optional().nullable(),
@@ -58,6 +64,76 @@ const updateQuotationSchema = createQuotationSchema.partial().extend({
   revised_currency: z.string().optional().nullable(),
   revised_notes: z.string().optional().nullable(),
 });
+
+const sendQuotationSchema = z.object({
+  email: z.string().email(),
+  message: z.string().max(4000).optional().nullable(),
+});
+
+const COMPANY_SETTINGS_KEY = 'invoice_company';
+
+function companyFromEnv() {
+  return {
+    name: process.env.COMPANY_NAME?.trim() || 'Company',
+    phone: process.env.COMPANY_PHONE?.trim() || '',
+    address: process.env.COMPANY_ADDRESS?.trim() || '',
+    vat_number: process.env.COMPANY_VAT_NUMBER?.trim() || '',
+  };
+}
+
+async function loadCompanySettings() {
+  const { data } = await supabase
+    .from('app_settings')
+    .select('value')
+    .eq('key', COMPANY_SETTINGS_KEY)
+    .maybeSingle();
+  if (data?.value && typeof data.value === 'object') {
+    const v = data.value as Record<string, string>;
+    return {
+      name: v.name || companyFromEnv().name,
+      phone: v.phone ?? companyFromEnv().phone,
+      address: v.address ?? companyFromEnv().address,
+      vat_number: v.vat_number ?? companyFromEnv().vat_number,
+    };
+  }
+  return companyFromEnv();
+}
+
+async function buildQuotationPdfForRecord(quotation: Record<string, unknown>, buyer: Record<string, unknown> | null) {
+  const price = getQuotationCustomerPrice(quotation as Parameters<typeof getQuotationCustomerPrice>[0]);
+  if (!price) {
+    throw new Error('Set a customer send price (finalize or revise quotation) before sending or downloading the quote PDF.');
+  }
+
+  const company = await loadCompanySettings();
+  const projectName =
+    (quotation.standalone_project_name as string | null) ||
+    ((quotation.projects as { project_name?: string } | null)?.project_name ?? null);
+
+  const pdfData: QuotationPdfData = {
+    quotation_number: String(quotation.quotation_number),
+    issue_date: new Date().toISOString().slice(0, 10),
+    valid_until: (quotation.deadline as string | null) || null,
+    currency: price.currency,
+    amount: price.amount,
+    requirement: String(quotation.requirement),
+    notes: price.notes,
+    project_name: projectName,
+    company_name: company.name,
+    company_address: company.address,
+    company_phone: company.phone || null,
+    company_vat_number: company.vat_number || null,
+    logo_path: resolveInvoiceLogoPath(),
+    client: {
+      name: (buyer?.buyer_name as string) || projectName || 'Client',
+      contact_person: (buyer?.contact_person as string | null) ?? null,
+      contact_email: (buyer?.contact_email as string | null) ?? (quotation.client_email as string | null),
+      address: (buyer?.address as string | null) ?? null,
+    },
+  };
+
+  return buildQuotationPdfBuffer(pdfData);
+}
 
 const vendorQuoteSchema = z.object({
   vendor_id: z.string().uuid().optional().nullable(),
@@ -432,7 +508,8 @@ router.get('/:id', async (req, res) => {
   if (qErr) return res.status(500).json({ error: qErr.message });
   if (!quotation) return res.status(404).json({ error: 'Not found' });
 
-  const [vendorQuotes, revisions, leadUser, project, followupsRaw, updatedByUser] = await Promise.all([
+  const [vendorQuotes, revisions, leadUser, project, followupsRaw, updatedByUser, linkedInvoices, buyerRow] =
+    await Promise.all([
     supabase
       .from('quotation_vendor_quotes')
       .select('*, vendors:vendors!quotation_vendor_quotes_vendor_id_fkey(id, vendor_name)')
@@ -461,6 +538,20 @@ router.get('/:id', async (req, res) => {
     (quotation as any).updated_by
       ? supabase.from('users').select('id, full_name, email').eq('id', (quotation as any).updated_by).maybeSingle()
       : Promise.resolve({ data: null as any, error: null as any }),
+    supabase
+      .from('invoices')
+      .select('id, invoice_number, status, total, currency, created_at')
+      .eq('quotation_id', id)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: false }),
+    (quotation as any).buyer_id
+      ? supabase
+          .from('buyers')
+          .select('id, buyer_name, contact_person, contact_email, address, city, state, postal_code, country')
+          .eq('id', (quotation as any).buyer_id)
+          .is('deleted_at', null)
+          .maybeSingle()
+      : Promise.resolve({ data: null as any, error: null as any }),
   ]);
 
   if (vendorQuotes.error) return res.status(500).json({ error: vendorQuotes.error.message });
@@ -469,6 +560,8 @@ router.get('/:id', async (req, res) => {
   if (project.error) return res.status(500).json({ error: project.error.message });
   if (followupsRaw.error) return res.status(500).json({ error: followupsRaw.error.message });
   if (updatedByUser.error) return res.status(500).json({ error: updatedByUser.error.message });
+  if (linkedInvoices.error) return res.status(500).json({ error: linkedInvoices.error.message });
+  if (buyerRow.error) return res.status(500).json({ error: buyerRow.error.message });
 
   const followRows = followupsRaw.data || [];
   const creatorIds = Array.from(new Set(followRows.map((r: any) => r.created_by).filter(Boolean)));
@@ -485,11 +578,119 @@ router.get('/:id', async (req, res) => {
     ...quotation,
     users: leadUser.data || null,
     projects: project.data || null,
+    buyer: buyerRow.data || null,
+    linked_invoices: linkedInvoices.data || [],
     quotation_vendor_quotes: vendorQuotes.data || [],
     quotation_revisions: revisions.data || [],
     quotation_followups,
     updated_by_user: updatedByUser.data || null,
   });
+});
+
+// GET /api/quotations/:id/pdf
+router.get('/:id/pdf', async (req, res) => {
+  const { data: quotation, error } = await supabase.from('quotations').select('*').eq('id', req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!quotation) return res.status(404).json({ error: 'Not found' });
+
+  let buyer: Record<string, unknown> | null = null;
+  if ((quotation as { buyer_id?: string }).buyer_id) {
+    const { data } = await supabase
+      .from('buyers')
+      .select('*')
+      .eq('id', (quotation as { buyer_id: string }).buyer_id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    buyer = data;
+  }
+
+  try {
+    const buffer = await buildQuotationPdfForRecord(quotation, buyer);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${quotation.quotation_number}.pdf"`);
+    res.send(buffer);
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : 'PDF generation failed' });
+  }
+});
+
+// POST /api/quotations/:id/send — email quote PDF to client
+router.post('/:id/send', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const parsed = sendQuotationSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+  }
+
+  const { data: quotation, error } = await supabase.from('quotations').select('*').eq('id', req.params.id).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!quotation) return res.status(404).json({ error: 'Not found' });
+
+  const price = getQuotationCustomerPrice(quotation);
+  if (!price) {
+    return res.status(400).json({
+      error: 'Set a customer send price (finalize enquiry or add a revision) before sending the quote.',
+    });
+  }
+
+  let buyer: Record<string, unknown> | null = null;
+  if (quotation.buyer_id) {
+    const { data } = await supabase
+      .from('buyers')
+      .select('*')
+      .eq('id', quotation.buyer_id)
+      .is('deleted_at', null)
+      .maybeSingle();
+    buyer = data;
+  }
+
+  const clientName =
+    (buyer?.buyer_name as string) ||
+    quotation.standalone_project_name ||
+    quotation.enquiry_title ||
+    'Client';
+
+  try {
+    const pdfBuffer = await buildQuotationPdfForRecord(quotation, buyer);
+    const emailResult = await sendQuotationEmail({
+      to: parsed.data.email,
+      quotationNumber: quotation.quotation_number,
+      clientName,
+      total: price.amount,
+      currency: price.currency,
+      pdfBuffer,
+      pdfFilename: `${quotation.quotation_number}.pdf`,
+      message: parsed.data.message,
+    });
+
+    const sentAt = new Date().toISOString();
+    const { data: updated, error: updErr } = await supabase
+      .from('quotations')
+      .update({
+        quote_sent_to_email: parsed.data.email,
+        quote_sent_at: sentAt,
+        quote_email_message_id: emailResult.id,
+        clarusto_quote_sent_at: quotation.clarusto_quote_sent_at || sentAt,
+        enquiry_stage: quotation.enquiry_stage === 'new_enquiry' ? 'quote_sent' : quotation.enquiry_stage,
+        client_email: parsed.data.email,
+        updated_by: userId,
+      })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (updErr || !updated) return res.status(500).json({ error: updErr?.message || 'Failed to update quotation' });
+
+    await logActivity(userId, `sent quotation ${quotation.quotation_number} to ${parsed.data.email}`, req.params.id, {
+      email: parsed.data.email,
+    });
+
+    res.json(updated);
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to send quotation' });
+  }
 });
 
 // POST /api/quotations
