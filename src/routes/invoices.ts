@@ -4,7 +4,12 @@ import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../middleware/auth.js";
 import { auditLog } from "../middleware/auditLog.js";
 import { sharedWriteGuard } from "../middleware/requireRole.js";
-import { generateNextInvoiceNumber, computeInvoiceTotals } from "../utils/invoiceNumber.js";
+import {
+  generateNextInvoiceNumber,
+  computeInvoiceTotalsFromTaxes,
+  type DiscountInput,
+  type InvoiceTaxInput,
+} from "../utils/invoiceNumber.js";
 import { buildInvoicePdfBuffer, resolveInvoiceLogoPath, type InvoicePdfData } from "../services/invoicePdf.js";
 import { sendInvoiceEmail } from "../services/invoiceEmail.js";
 
@@ -15,8 +20,32 @@ const invoiceStatus = z.enum(["draft", "sent", "paid", "overdue", "cancelled"]);
 
 const lineItemSchema = z.object({
   description: z.string().min(1),
+  line_detail: z.string().optional().nullable(),
   quantity: z.number().positive(),
   unit_price: z.number().min(0),
+});
+
+const discountSchema = z
+  .object({
+    type: z.enum(["percent", "fixed"]),
+    value: z.number().min(0),
+  })
+  .optional()
+  .nullable();
+
+const companySettingsSchema = z.object({
+  name: z.string().min(1),
+  phone: z.string().optional().nullable(),
+  address: z.string().optional().nullable(),
+  vat_number: z.string().optional().nullable(),
+});
+
+const COMPANY_SETTINGS_KEY = "invoice_company";
+
+const taxSchema = z.object({
+  rate: z.number().min(0).max(100),
+  name: z.string().min(1),
+  tax_number: z.string().optional().nullable(),
 });
 
 const createSchema = z.object({
@@ -24,7 +53,10 @@ const createSchema = z.object({
   issue_date: z.string().optional(),
   due_date: z.string(),
   currency: z.string().min(3).max(3).default("INR"),
-  tax_rate: z.number().min(0).max(100).default(0),
+  tax_rate: z.number().min(0).max(100).optional(),
+  taxes: z.array(taxSchema).optional(),
+  reference: z.string().optional().nullable(),
+  discount: discountSchema,
   notes: z.string().optional().nullable(),
   terms: z.string().optional().nullable(),
   line_items: z.array(lineItemSchema).min(1),
@@ -50,12 +82,73 @@ async function logActivity(userId: string, action: string, recordId?: string, de
 
 function mapLineItems(lines: z.infer<typeof lineItemSchema>[]) {
   return lines.map((l, i) => ({
-    description: l.description,
+    description: l.description.trim(),
+    line_detail: l.line_detail?.trim() || null,
     quantity: l.quantity,
     unit_price: l.unit_price,
     amount: Math.round(l.quantity * l.unit_price * 100) / 100,
     sort_order: i,
   }));
+}
+
+function resolveDiscount(body: { discount?: DiscountInput }): DiscountInput {
+  const d = body.discount;
+  if (!d || d.value <= 0) return null;
+  return d;
+}
+
+function companyFromEnv() {
+  return {
+    name: process.env.COMPANY_NAME?.trim() || "Company",
+    phone: process.env.COMPANY_PHONE?.trim() || "",
+    address: process.env.COMPANY_ADDRESS?.trim() || "",
+    vat_number: process.env.COMPANY_VAT_NUMBER?.trim() || "",
+  };
+}
+
+async function loadCompanySettings() {
+  const { data } = await supabase
+    .from("app_settings")
+    .select("value")
+    .eq("key", COMPANY_SETTINGS_KEY)
+    .maybeSingle();
+  if (data?.value && typeof data.value === "object") {
+    const v = data.value as Record<string, string>;
+    return {
+      name: v.name || companyFromEnv().name,
+      phone: v.phone ?? companyFromEnv().phone,
+      address: v.address ?? companyFromEnv().address,
+      vat_number: v.vat_number ?? companyFromEnv().vat_number,
+    };
+  }
+  return companyFromEnv();
+}
+
+function resolveTaxInputs(body: { taxes?: InvoiceTaxInput[]; tax_rate?: number }): InvoiceTaxInput[] {
+  if (body.taxes?.length) return body.taxes;
+  if (body.tax_rate != null && body.tax_rate > 0) {
+    return [{ rate: body.tax_rate, name: String(body.tax_rate) }];
+  }
+  return [];
+}
+
+async function saveInvoiceTaxes(
+  invoiceId: string,
+  taxes: Array<{ rate: number; name: string; tax_number?: string | null; amount: number; sort_order: number }>,
+) {
+  await supabase.from("invoice_taxes").delete().eq("invoice_id", invoiceId);
+  if (taxes.length === 0) return;
+  const { error } = await supabase.from("invoice_taxes").insert(
+    taxes.map((t) => ({
+      invoice_id: invoiceId,
+      rate: t.rate,
+      name: t.name,
+      tax_number: t.tax_number ?? null,
+      amount: t.amount,
+      sort_order: t.sort_order,
+    })),
+  );
+  if (error) throw new Error(error.message);
 }
 
 async function fetchInvoiceDetail(id: string) {
@@ -68,34 +161,64 @@ async function fetchInvoiceDetail(id: string) {
 
   if (error || !invoice) return null;
 
-  const [{ data: lines }, { data: buyer }] = await Promise.all([
+  const [{ data: lines }, { data: buyer }, { data: taxes }] = await Promise.all([
     supabase
       .from("invoice_line_items")
       .select("*")
       .eq("invoice_id", id)
       .order("sort_order", { ascending: true }),
     supabase.from("buyers").select("*").eq("id", invoice.buyer_id).is("deleted_at", null).maybeSingle(),
+    supabase
+      .from("invoice_taxes")
+      .select("*")
+      .eq("invoice_id", id)
+      .order("sort_order", { ascending: true }),
   ]);
 
-  return { ...invoice, line_items: lines || [], buyer: buyer || null };
+  const taxRows = taxes?.length
+    ? taxes
+    : Number(invoice.tax_rate) > 0
+      ? [
+          {
+            rate: invoice.tax_rate,
+            name: String(invoice.tax_rate),
+            tax_number: process.env.COMPANY_VAT_NUMBER?.trim() || null,
+            amount: invoice.tax_amount,
+            sort_order: 0,
+          },
+        ]
+      : [];
+
+  return { ...invoice, line_items: lines || [], buyer: buyer || null, taxes: taxRows };
 }
 
 async function buildPdfForInvoice(detail: NonNullable<Awaited<ReturnType<typeof fetchInvoiceDetail>>>) {
+  const company = await loadCompanySettings();
   const pdfData: InvoicePdfData = {
     invoice_number: detail.invoice_number,
     issue_date: detail.issue_date,
     due_date: detail.due_date,
     currency: detail.currency,
+    reference: detail.reference ?? null,
     subtotal: Number(detail.subtotal),
+    discount_amount: Number(detail.discount_amount ?? 0),
     tax_rate: Number(detail.tax_rate),
     tax_amount: Number(detail.tax_amount),
     total: Number(detail.total),
     notes: detail.notes,
     terms: detail.terms,
-    company_name: process.env.COMPANY_NAME?.trim() || "Company",
-    company_address: process.env.COMPANY_ADDRESS?.trim() || "",
-    company_phone: process.env.COMPANY_PHONE?.trim() || null,
-    company_vat_number: process.env.COMPANY_VAT_NUMBER?.trim() || null,
+    company_name: company.name,
+    company_address: company.address,
+    company_phone: company.phone || null,
+    company_vat_number: company.vat_number || null,
+    taxes: (detail.taxes || []).map(
+      (t: { rate: number; name: string; tax_number?: string | null; amount: number }) => ({
+        rate: Number(t.rate),
+        name: t.name,
+        tax_number: t.tax_number,
+        amount: Number(t.amount),
+      }),
+    ),
     logo_path: resolveInvoiceLogoPath(),
     amount_paid: 0,
     buyer: {
@@ -109,8 +232,15 @@ async function buildPdfForInvoice(detail: NonNullable<Awaited<ReturnType<typeof 
       country: detail.buyer?.country,
     },
     line_items: (detail.line_items || []).map(
-      (l: { description: string; quantity: number; unit_price: number; amount: number }) => ({
+      (l: {
+        description: string;
+        line_detail?: string | null;
+        quantity: number;
+        unit_price: number;
+        amount: number;
+      }) => ({
         description: l.description,
+        subtext: l.line_detail,
         quantity: Number(l.quantity),
         unit_price: Number(l.unit_price),
         amount: Number(l.amount),
@@ -161,6 +291,35 @@ router.get("/", async (req, res) => {
   res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
 });
 
+// GET /api/invoices/settings/company
+router.get("/settings/company", async (_req, res) => {
+  try {
+    res.json(await loadCompanySettings());
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : "Failed to load company settings" });
+  }
+});
+
+// PUT /api/invoices/settings/company
+router.put("/settings/company", async (req, res) => {
+  const parsed = companySettingsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validation failed", issues: parsed.error.issues });
+  }
+  const value = {
+    name: parsed.data.name,
+    phone: parsed.data.phone?.trim() || "",
+    address: parsed.data.address?.trim() || "",
+    vat_number: parsed.data.vat_number?.trim() || "",
+  };
+  const { error } = await supabase.from("app_settings").upsert(
+    { key: COMPANY_SETTINGS_KEY, value, updated_at: new Date().toISOString() },
+    { onConflict: "key" },
+  );
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(value);
+});
+
 // POST /api/invoices
 router.post("/", async (req, res) => {
   const parsed = createSchema.safeParse(req.body);
@@ -168,8 +327,10 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: "Validation failed", issues: parsed.error.issues });
   }
 
-  const { buyer_id, due_date, currency, tax_rate, notes, terms, line_items } = parsed.data;
+  const { buyer_id, due_date, currency, notes, terms, line_items, reference } = parsed.data;
   const issue_date = parsed.data.issue_date || new Date().toISOString().slice(0, 10);
+  const taxInputs = resolveTaxInputs(parsed.data);
+  const discount = resolveDiscount(parsed.data);
 
   const { data: buyer, error: buyerErr } = await supabase
     .from("buyers")
@@ -181,7 +342,7 @@ router.post("/", async (req, res) => {
   if (buyerErr || !buyer) return res.status(400).json({ error: "Buyer not found" });
 
   const mapped = mapLineItems(line_items);
-  const totals = computeInvoiceTotals(mapped, tax_rate);
+  const totals = computeInvoiceTotalsFromTaxes(mapped, taxInputs, discount);
   const invoice_number = await generateNextInvoiceNumber(supabase);
   const userId = req.user?.id;
 
@@ -194,11 +355,17 @@ router.post("/", async (req, res) => {
       issue_date,
       due_date,
       currency: currency.toUpperCase(),
-      tax_rate,
+      tax_rate: totals.tax_rate,
+      reference: reference?.trim() || null,
+      discount_type: discount?.type ?? null,
+      discount_value: discount?.value ?? 0,
+      discount_amount: totals.discount_amount,
       notes: notes ?? null,
       terms: terms ?? null,
       created_by: userId,
-      ...totals,
+      subtotal: totals.subtotal,
+      tax_amount: totals.tax_amount,
+      total: totals.total,
     })
     .select()
     .single();
@@ -210,6 +377,13 @@ router.post("/", async (req, res) => {
   if (linesErr) {
     await supabase.from("invoices").delete().eq("id", invoice.id);
     return res.status(500).json({ error: linesErr.message });
+  }
+
+  try {
+    await saveInvoiceTaxes(invoice.id, totals.taxes);
+  } catch (e) {
+    await supabase.from("invoices").delete().eq("id", invoice.id);
+    return res.status(500).json({ error: e instanceof Error ? e.message : "Failed to save taxes" });
   }
 
   if (userId) await logActivity(userId, "invoice_created", invoice.id, { invoice_number });
@@ -253,33 +427,87 @@ router.put("/:id", async (req, res) => {
   }
 
   const payload = parsed.data;
-  let totals = {
-    subtotal: Number(detail.subtotal),
-    tax_amount: Number(detail.tax_amount),
-    total: Number(detail.total),
-  };
-  const tax_rate = payload.tax_rate ?? Number(detail.tax_rate);
+  const discount =
+    payload.discount !== undefined
+      ? resolveDiscount({ discount: payload.discount })
+      : detail.discount_type && Number(detail.discount_value) > 0
+        ? { type: detail.discount_type as "percent" | "fixed", value: Number(detail.discount_value) }
+        : null;
+
+  let totals = computeInvoiceTotalsFromTaxes(
+    (detail.line_items || []).map((l: { quantity: number; unit_price: number }) => ({
+      quantity: Number(l.quantity),
+      unit_price: Number(l.unit_price),
+    })),
+    (detail.taxes || []).map((t: { rate: number; name: string; tax_number?: string | null }) => ({
+      rate: Number(t.rate),
+      name: t.name,
+      tax_number: t.tax_number,
+    })),
+    discount,
+  );
+
+  const taxInputs =
+    payload.taxes != null
+      ? payload.taxes
+      : payload.tax_rate != null
+        ? resolveTaxInputs({ tax_rate: payload.tax_rate })
+        : null;
 
   if (payload.line_items) {
     const mapped = mapLineItems(payload.line_items);
-    totals = computeInvoiceTotals(mapped, tax_rate);
+    const inputs =
+      taxInputs ??
+      resolveTaxInputs({
+        taxes: (detail.taxes || []).map((t: { rate: number; name: string; tax_number?: string | null }) => ({
+          rate: Number(t.rate),
+          name: t.name,
+          tax_number: t.tax_number,
+        })),
+      });
+    totals = computeInvoiceTotalsFromTaxes(mapped, inputs, discount);
     await supabase.from("invoice_line_items").delete().eq("invoice_id", detail.id);
     await supabase.from("invoice_line_items").insert(mapped.map((l) => ({ ...l, invoice_id: detail.id })));
-  } else if (payload.tax_rate != null) {
+    try {
+      await saveInvoiceTaxes(detail.id, totals.taxes);
+    } catch (e) {
+      return res.status(500).json({ error: e instanceof Error ? e.message : "Failed to save taxes" });
+    }
+  } else if (taxInputs != null || payload.discount !== undefined) {
     const { data: existingLines } = await supabase
       .from("invoice_line_items")
       .select("quantity, unit_price")
       .eq("invoice_id", detail.id);
-    totals = computeInvoiceTotals(
+    const inputs =
+      taxInputs ??
+      resolveTaxInputs({
+        taxes: (detail.taxes || []).map((t: { rate: number; name: string; tax_number?: string | null }) => ({
+          rate: Number(t.rate),
+          name: t.name,
+          tax_number: t.tax_number,
+        })),
+      });
+    totals = computeInvoiceTotalsFromTaxes(
       (existingLines || []).map((l) => ({ quantity: Number(l.quantity), unit_price: Number(l.unit_price) })),
-      tax_rate,
+      inputs,
+      discount,
     );
+    try {
+      await saveInvoiceTaxes(detail.id, totals.taxes);
+    } catch (e) {
+      return res.status(500).json({ error: e instanceof Error ? e.message : "Failed to save taxes" });
+    }
   }
 
   const updateRow: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
-    tax_rate,
-    ...totals,
+    tax_rate: totals.tax_rate ?? Number(detail.tax_rate),
+    subtotal: totals.subtotal,
+    discount_type: discount?.type ?? null,
+    discount_value: discount?.value ?? 0,
+    discount_amount: totals.discount_amount,
+    tax_amount: totals.tax_amount,
+    total: totals.total,
     pdf_url: null,
     pdf_path: null,
   };
@@ -288,6 +516,7 @@ router.put("/:id", async (req, res) => {
   if (payload.issue_date) updateRow.issue_date = payload.issue_date;
   if (payload.due_date) updateRow.due_date = payload.due_date;
   if (payload.currency) updateRow.currency = payload.currency.toUpperCase();
+  if (payload.reference !== undefined) updateRow.reference = payload.reference?.trim() || null;
   if (payload.notes !== undefined) updateRow.notes = payload.notes;
   if (payload.terms !== undefined) updateRow.terms = payload.terms;
 

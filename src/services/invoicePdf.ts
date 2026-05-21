@@ -31,8 +31,15 @@ export type InvoicePdfLine = {
   amount: number;
   /** e.g. "AT ACTUAL" — shown under description */
   subtext?: string | null;
-  /** true → show "+{tax_rate}%" under Rate column (reference Invoice 0024425) */
+  /** true → show "+{tax_rate}%" under Unit price column */
   vat_applicable?: boolean;
+};
+
+export type InvoicePdfTax = {
+  rate: number;
+  name: string;
+  tax_number?: string | null;
+  amount: number;
 };
 
 export type InvoicePdfData = {
@@ -40,7 +47,9 @@ export type InvoicePdfData = {
   issue_date: string;
   due_date: string;
   currency: string;
+  reference?: string | null;
   subtotal: number;
+  discount_amount?: number;
   tax_rate: number;
   tax_amount: number;
   total: number;
@@ -49,12 +58,18 @@ export type InvoicePdfData = {
   terms?: string | null;
   buyer: InvoicePdfBuyer;
   line_items: InvoicePdfLine[];
+  taxes?: InvoicePdfTax[];
   company_name: string;
   company_address: string;
   company_phone?: string | null;
   company_vat_number?: string | null;
   logo_path?: string | null;
 };
+
+function taxRowLabel(tax: InvoicePdfTax): string {
+  const name = tax.name?.trim() || String(tax.rate);
+  return `${tax.rate}% (${name})`;
+}
 
 const MARGIN = 54;
 const PAGE_W = 595.28;
@@ -229,8 +244,8 @@ export function buildInvoicePdfBuffer(data: InvoicePdfData): Promise<Buffer> {
     const drawTableHeader = (y: number) => {
       doc.font("Helvetica-Bold").fontSize(8).fillColor(C_LABEL);
       doc.text("Description", TC.desc, y, { width: TW.desc });
-      doc.text("Rate", TC.rate, y, { width: TW.rate, align: "right" });
-      doc.text("Qty", TC.qty, y, { width: TW.qty, align: "right" });
+      doc.text("Quantity", TC.qty, y, { width: TW.qty, align: "right" });
+      doc.text("Unit price", TC.unit, y, { width: TW.unit, align: "right" });
       doc.text("Line Total", TC.total, y, { width: TW.total, align: "right" });
       return y + 18;
     };
@@ -299,6 +314,10 @@ export function buildInvoicePdfBuffer(data: InvoicePdfData): Promise<Buffer> {
 
     let b3 = drawLabel(col3X, detailsY, col3W, "Invoice Number", "right");
     b3 = drawValue(col3X, b3, col3W, [displayInvNo(data.invoice_number)], { align: "right" });
+    if (data.reference?.trim()) {
+      b3 = drawLabel(col3X, b3 + 6, col3W, "Reference", "right");
+      b3 = drawValue(col3X, b3, col3W, [data.reference.trim()], { align: "right" });
+    }
 
     let b4 = drawLabel(col4X, detailsY, col4W, `Amount Due (${currency})`, "right");
     b4 = drawValue(col4X, b4, col4W, [fmtDue(amountDue, currency)], {
@@ -314,15 +333,15 @@ export function buildInvoicePdfBuffer(data: InvoicePdfData): Promise<Buffer> {
 
     const TC = {
       desc: MARGIN,
-      rate: MARGIN + 268,
-      qty: MARGIN + 358,
-      total: MARGIN + 408,
+      qty: MARGIN + 238,
+      unit: MARGIN + 294,
+      total: MARGIN + 398,
     };
     const TW = {
-      desc: 255,
-      rate: 85,
-      qty: 45,
-      total: CONTENT_W - 408,
+      desc: 225,
+      qty: 50,
+      unit: 98,
+      total: CONTENT_W - 398,
     };
 
     hline(tableY);
@@ -357,20 +376,21 @@ export function buildInvoicePdfBuffer(data: InvoicePdfData): Promise<Buffer> {
       }
 
       doc.font("Helvetica").fontSize(FS_TABLE).fillColor(C_TEXT);
-      doc.text(fmtTableAmount(item.unit_price, currency), TC.rate, ry, {
-        width: TW.rate,
+      doc.text(String(item.quantity), TC.qty, ry, { width: TW.qty, align: "right" });
+
+      doc.text(fmtTableAmount(item.unit_price, currency), TC.unit, ry, {
+        width: TW.unit,
         align: "right",
       });
 
       let rSubY = ry + 12;
       for (const rs of rateSubtexts) {
         doc.font("Helvetica").fontSize(8).fillColor(C_MUTED);
-        doc.text(rs, TC.rate, rSubY, { width: TW.rate, align: "right" });
+        doc.text(rs, TC.unit, rSubY, { width: TW.unit, align: "right" });
         rSubY += 11;
       }
 
       doc.font("Helvetica").fontSize(FS_TABLE).fillColor(C_TEXT);
-      doc.text(String(item.quantity), TC.qty, ry, { width: TW.qty, align: "right" });
       doc.text(fmtTableAmount(item.amount, currency), TC.total, ry, {
         width: TW.total,
         align: "right",
@@ -396,14 +416,37 @@ export function buildInvoicePdfBuffer(data: InvoicePdfData): Promise<Buffer> {
 
     totRow("Subtotal", fmtTotals(data.subtotal, currency));
 
-    if (data.tax_rate > 0) {
-      totRow(`${data.tax_rate}% (${data.tax_rate}%)`, fmtTotals(data.tax_amount, currency));
-      if (data.company_vat_number) {
+    const discountAmt = data.discount_amount ?? 0;
+    if (discountAmt > 0) {
+      totRow("Discount", `-${fmtTotals(discountAmt, currency)}`);
+    }
+
+    const pdfTaxes =
+      data.taxes?.length
+        ? data.taxes
+        : data.tax_rate > 0
+          ? [
+              {
+                rate: data.tax_rate,
+                name: String(data.tax_rate),
+                tax_number: data.company_vat_number,
+                amount: data.tax_amount,
+              },
+            ]
+          : [];
+
+    for (const tax of pdfTaxes) {
+      if (tax.rate <= 0 && tax.amount <= 0) continue;
+      totRow(taxRowLabel(tax), fmtTotals(tax.amount, currency));
+      const taxNum = tax.tax_number?.trim();
+      if (taxNum) {
         doc.font("Helvetica").fontSize(8).fillColor(C_MUTED);
-        doc.text(data.company_vat_number, totX, ty - 4, { width: lblW, align: "left" });
+        doc.text(taxNum, totX, ty - 4, { width: lblW, align: "left" });
         ty += 10;
       }
-    } else if (data.tax_amount > 0) {
+    }
+
+    if (pdfTaxes.length === 0 && data.tax_amount > 0) {
       totRow("Tax", fmtTotals(data.tax_amount, currency));
     }
 
