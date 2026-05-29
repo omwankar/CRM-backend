@@ -24,6 +24,10 @@ import { registerCommentRoutes } from "./routes/comments.js";
 import { registerQuotationRoutes } from "./routes/quotations.js";
 import { registerHrRoutes } from "./routes/hr/index.js";
 import { registerInvoiceRoutes } from "./routes/invoices.js";
+import { registerAnnouncementRoutes } from "./routes/announcements.js";
+import { registerKnowledgeBaseRoutes } from "./routes/knowledgebase.js";
+import { registerReportRoutes } from "./routes/reports.js";
+import { registerTimeLogRoutes } from "./routes/timelogs.js";
 
 const env = loadEnv();
 
@@ -59,6 +63,10 @@ registerCommentRoutes(api);
 registerQuotationRoutes(api);
 registerHrRoutes(api);
 registerInvoiceRoutes(api);
+registerAnnouncementRoutes(api);
+registerKnowledgeBaseRoutes(api);
+registerReportRoutes(api);
+registerTimeLogRoutes(api);
 app.use("/api", api);
 
 app.listen(env.PORT, () => {
