@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../../middleware/auth.js";
 import { requireHrAccess } from "../../middleware/requireRole.js";
 import { computeEmployeeMonthAttendance } from "../../lib/attendanceCompute.js";
+import { computeAttendanceGrid } from "../../lib/attendanceGrid.js";
 
 const router = express.Router();
 const supabase = createClient(
@@ -181,6 +182,20 @@ router.get("/employee/:userId", async (req, res) => {
     res.json({ ...attendance, employee: user });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : "Failed to load attendance" });
+  }
+});
+
+/**
+ * Monthly muster-roll grid: one row per active employee, one column per day of
+ * the month, with a single primary status marker per cell.
+ */
+router.get("/grid", async (req, res) => {
+  const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+  try {
+    const grid = await computeAttendanceGrid(supabase, month);
+    res.json(grid);
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : "Failed to load grid" });
   }
 });
 

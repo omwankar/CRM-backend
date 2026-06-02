@@ -5,6 +5,7 @@ import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
 import { computeWorkingDays, getHolidayDatesInRange, getLeaveUsage } from '../lib/leave.js';
 import { computeEmployeeMonthAttendance } from '../lib/attendanceCompute.js';
+import { computeAttendanceGrid } from '../lib/attendanceGrid.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -81,6 +82,21 @@ router.get('/attendance/me', async (req, res) => {
     res.json(attendance);
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to load attendance' });
+  }
+});
+
+// GET /attendance-grid — month grid for Leave Tracker (team for managers, own row for employees)
+router.get('/attendance-grid', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+  const isManager = req.user?.role === 'manager' || req.user?.role === 'super_admin';
+  try {
+    const grid = await computeAttendanceGrid(supabase, month, isManager ? undefined : { userId });
+    res.json(grid);
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to load grid' });
   }
 });
 
