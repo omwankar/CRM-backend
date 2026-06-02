@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
+import { computeWorkingDays, getHolidayDatesInRange, getLeaveUsage } from '../lib/leave.js';
+import { computeEmployeeMonthAttendance } from '../lib/attendanceCompute.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -28,7 +30,6 @@ const leaveSubmitSchema = z.object({
   start_date: z.string(),
   end_date: z.string(),
   reason: z.string().optional(),
-  leave_type: z.enum(['paid', 'unpaid', 'lop']).default('unpaid'),
 });
 
 async function notifyLeave(userId: string, title: string, message: string) {
@@ -47,12 +48,40 @@ router.get('/leave-requests', async (req, res) => {
 
   const { data, error } = await supabase
     .from('leave_requests')
-    .select('id, start_date, end_date, reason, leave_type, status, reviewed_at, created_at')
+    .select('id, start_date, end_date, reason, leave_type, working_days, status, reviewed_at, created_at')
     .eq('requested_by', userId)
     .order('created_at', { ascending: false });
 
   if (error) return res.status(500).json({ error: error.message });
   res.json({ data: data || [] });
+});
+
+// GET /leave-balance — current user's paid-leave balance for a calendar year
+router.get('/leave-balance', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const year = Number(req.query.year) || new Date().getFullYear();
+  try {
+    const usage = await getLeaveUsage(supabase, userId, year);
+    res.json(usage);
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to load balance' });
+  }
+});
+
+// GET /attendance/me — current user's own day-wise attendance for a month
+router.get('/attendance/me', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+  try {
+    const attendance = await computeEmployeeMonthAttendance(supabase, userId, month);
+    res.json(attendance);
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to load attendance' });
+  }
 });
 
 // POST /leave-requests — submit leave (all authenticated users)
@@ -75,6 +104,19 @@ router.post('/leave-requests', async (req, res) => {
     .eq('id', userId)
     .maybeSingle();
 
+  // Auto-classify: count working days (skip weekends + holidays), then decide
+  // paid vs unpaid against the remaining balance. If the balance can't cover the
+  // whole request, the entire request is unpaid.
+  const holidayDates = await getHolidayDatesInRange(
+    supabase,
+    parsed.data.start_date,
+    parsed.data.end_date,
+  );
+  const workingDays = computeWorkingDays(parsed.data.start_date, parsed.data.end_date, holidayDates);
+  const year = Number(parsed.data.start_date.slice(0, 4)) || new Date().getFullYear();
+  const usage = await getLeaveUsage(supabase, userId, year);
+  const leaveType = workingDays > 0 && workingDays <= usage.remaining ? 'paid' : 'unpaid';
+
   const { data, error } = await supabase
     .from('leave_requests')
     .insert({
@@ -83,7 +125,8 @@ router.post('/leave-requests', async (req, res) => {
       start_date: parsed.data.start_date,
       end_date: parsed.data.end_date,
       reason: parsed.data.reason,
-      leave_type: parsed.data.leave_type,
+      leave_type: leaveType,
+      working_days: workingDays,
       status: 'pending',
     })
     .select()
