@@ -37,11 +37,9 @@ const C_MUTED = "#999999";
 const C_ACCENT = "#0d9488";
 
 function formatMoney(currency: string, amount: number) {
-  try {
-    return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amount);
-  } catch {
-    return `${currency} ${amount.toFixed(2)}`;
-  }
+  const n = amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (currency === "SAR") return `${n}\u0631.\u0633`;
+  return n;
 }
 
 export function buildQuotationPdfBuffer(data: QuotationPdfData): Promise<Buffer> {

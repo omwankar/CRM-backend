@@ -99,27 +99,14 @@ function fmtSAR(n: number): string {
   return `${fmtNum(n)}\u0631.\u0633`;
 }
 
+/** PDF-safe amounts — Helvetica lacks ₹, €, etc.; currency is shown in column labels. */
 function fmtTableAmount(n: number, currency: string): string {
   if (currency === "SAR") return fmtSAR(n);
-  try {
-    return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
-  } catch {
-    return `${currency} ${fmtNum(n)}`;
-  }
+  return fmtNum(n);
 }
 
-function fmtTotals(n: number, currency: string): string {
-  if (currency === "SAR") return fmtNum(n);
-  try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency,
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(n);
-  } catch {
-    return `${currency} ${fmtNum(n)}`;
-  }
+function fmtTotals(n: number, _currency: string): string {
+  return fmtNum(n);
 }
 
 function fmtDue(n: number, currency: string): string {
