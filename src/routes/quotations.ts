@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
-import { sharedWriteGuard } from '../middleware/requireRole.js';
 import { buildQuotationPdfBuffer, type QuotationPdfData } from '../services/quotationPdf.js';
 import { sendQuotationEmail } from '../services/quotationEmail.js';
 import { resolveInvoiceLogoPath } from '../services/invoicePdf.js';
@@ -12,8 +11,9 @@ import { getQuotationCustomerPrice } from '../utils/quotationPricing.js';
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
+// All authenticated users (including employees) can create and work on
+// quotations/enquiries. Deletes stay restricted via requireRole below.
 router.use(authMiddleware);
-router.use(sharedWriteGuard);
 router.use(auditLog);
 
 const quotationStatus = z.enum([
@@ -220,15 +220,18 @@ router.get('/', async (req, res) => {
       }
     }
 
-    // UI/permission guard: employees can only see their own lead or linked project assignments
-    if (role === 'employee' && userId) {
+    // Permission guard: plain users see quotations they created, lead, or are
+    // assigned to via a project. Managers and super_admins see everything.
+    if (role === 'user' && userId) {
       // We cannot do a join + EXISTS easily with the JS client, so we fetch project_ids they can see and filter.
       const { data: projectEmp } = await supabase
         .from('project_employees')
         .select('project_id')
         .eq('user_id', userId);
       const allowedProjects = (projectEmp || []).map((x: any) => x.project_id).filter(Boolean);
-      query = query.or(`enquiry_lead.eq.${userId},project_id.in.(${allowedProjects.join(',') || '00000000-0000-0000-0000-000000000000'})`);
+      query = query.or(
+        `created_by.eq.${userId},enquiry_lead.eq.${userId},project_id.in.(${allowedProjects.join(',') || '00000000-0000-0000-0000-000000000000'})`,
+      );
     }
 
     query = query
@@ -813,7 +816,7 @@ router.put('/vendor-quotes/:quoteId', async (req, res) => {
 
 // DELETE /api/quotations/vendor-quotes/:quoteId
 router.delete('/vendor-quotes/:quoteId', async (req, res) => {
-  if (!requireRole(req, res, ['super_admin', 'admin'])) return;
+  if (!requireRole(req, res, ['super_admin', 'manager'])) return;
 
   const { data, error } = await supabase
     .from('quotation_vendor_quotes')

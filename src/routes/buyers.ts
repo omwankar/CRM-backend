@@ -27,6 +27,7 @@ const schema = z.object({
   industry: z.string().optional(),
   description: z.string().optional(),
   buyer_portal_link: z.string().optional(),
+  credit_limit: z.number().optional().nullable(),
   pipeline_stage_id: z.string().uuid().optional(),
   pipeline_notes: z.string().optional(),
   pipeline_value: z.number().optional(),

@@ -45,21 +45,23 @@ export const authMiddleware: RequestHandler = async (req, res, next) => {
       .maybeSingle();
 
     if (userError) {
-      console.error('Auth middleware: Error fetching user data:', userError);
+      console.error('Auth middleware: Error fetching user data:', userError.message);
+      res.status(500).json({ error: 'Failed to load user profile' });
+      return;
     }
 
+    // Fail closed: a valid token without a profile row gets no access
     if (!userData) {
-      console.error('Auth middleware: User not found in users table:', user.id);
+      res.status(403).json({ error: 'User profile not found. Contact an administrator.' });
+      return;
     }
 
     req.user = {
       id: user.id,
-      email: userData?.email || user.email || '',
-      role: userData?.role || 'user',
-      full_name: userData?.full_name || null,
+      email: userData.email || user.email || '',
+      role: userData.role || 'user',
+      full_name: userData.full_name || null,
     };
-    
-    console.log('Auth middleware: User authenticated:', req.user.email, 'Role:', req.user.role);
 
     next();
   } catch {

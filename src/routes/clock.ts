@@ -100,6 +100,22 @@ router.get('/attendance-grid', async (req, res) => {
   }
 });
 
+// GET /holidays — read-only company holiday list (all authenticated users)
+router.get('/holidays', async (req, res) => {
+  const year = Number(req.query.year) || new Date().getFullYear();
+
+  const { data, error } = await supabase
+    .from('calendar_events')
+    .select('id, date, title, description, holiday_pay_type')
+    .eq('event_type', 'holiday')
+    .gte('date', `${year}-01-01`)
+    .lte('date', `${year}-12-31`)
+    .order('date', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data: data || [], year });
+});
+
 // POST /leave-requests — submit leave (all authenticated users)
 router.post('/leave-requests', async (req, res) => {
   const userId = req.user?.id;
@@ -149,6 +165,13 @@ router.post('/leave-requests', async (req, res) => {
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
+
+  await notifyLeave(
+    userId,
+    'Leave request submitted',
+    `Your ${leaveType} leave from ${parsed.data.start_date} to ${parsed.data.end_date} (${workingDays} working day${workingDays === 1 ? '' : 's'}) is pending approval.`,
+  );
+
   res.status(201).json(data);
 });
 
@@ -190,6 +213,16 @@ router.post('/clock-in', async (req, res) => {
 
   const parsed = clockInSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+
+  const { data: openSession } = await supabase
+    .from('clock_sessions')
+    .select('id')
+    .eq('user_id', userId)
+    .is('clock_out', null)
+    .maybeSingle();
+  if (openSession) {
+    return res.status(400).json({ error: 'You are already clocked in. Clock out first.' });
+  }
 
   const { data, error } = await supabase
     .from('clock_sessions')
@@ -347,7 +380,10 @@ router.put('/punch-requests/:id/approve', async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  // Create clock session if times available
+  // Apply the approved punch to clock sessions. Requests are stored as
+  // { type: 'clock_in' | 'clock_out', requested_at } (legacy rows may have
+  // requested_clock_in / requested_clock_out instead).
+  let sessionApplied = false;
   if (request.requested_clock_in) {
     await supabase.from('clock_sessions').insert({
       user_id: request.user_id,
@@ -355,6 +391,32 @@ router.put('/punch-requests/:id/approve', async (req, res) => {
       clock_out: request.requested_clock_out || null,
       notes: 'Approved punch request',
     });
+    sessionApplied = true;
+  } else if (request.type === 'clock_in' && request.requested_at) {
+    await supabase.from('clock_sessions').insert({
+      user_id: request.user_id,
+      clock_in: request.requested_at,
+      notes: 'Approved punch request',
+    });
+    sessionApplied = true;
+  } else if (request.type === 'clock_out' && request.requested_at) {
+    // Close the most recent session that started before the requested time
+    const { data: openSession } = await supabase
+      .from('clock_sessions')
+      .select('id, clock_in')
+      .eq('user_id', request.user_id)
+      .is('clock_out', null)
+      .lte('clock_in', request.requested_at)
+      .order('clock_in', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (openSession) {
+      await supabase
+        .from('clock_sessions')
+        .update({ clock_out: request.requested_at, notes: 'Approved punch request' })
+        .eq('id', openSession.id);
+      sessionApplied = true;
+    }
   }
 
   // Notify employee
@@ -372,7 +434,7 @@ router.put('/punch-requests/:id/approve', async (req, res) => {
     record_id: req.params.id,
   });
 
-  res.json({ success: true, session_created: !!request.requested_clock_in });
+  res.json({ success: true, session_created: sessionApplied });
 });
 
 // PUT /punch-requests/:id/reject (super_admin only)

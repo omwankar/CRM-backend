@@ -14,7 +14,8 @@ router.use(auditLog);
 
 const schema = z.object({
   vendor_name: z.string().min(1),
-  vendor_type: z.enum(['product', 'service', 'both']).optional(),
+  vendor_type: z.string().optional(),
+  payment_terms: z.string().optional(),
   contact_person: z.string().optional(),
   contact_email: z.string().optional(),
   contact_phone: z.string().optional(),

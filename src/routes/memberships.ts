@@ -12,15 +12,19 @@ router.use(authMiddleware);
 router.use(sharedWriteGuard);
 router.use(auditLog);
 
+const emptyToUndef = (v: unknown) => (v === '' ? undefined : v);
+
 const schema = z.object({
   organization_name: z.string().min(1),
   membership_type: z.string().optional(),
   member_id: z.string().optional(),
-  join_date: z.string(),
-  renewal_date: z.string().optional(),
+  membership_number: z.string().optional(),
+  membership_fee: z.preprocess(emptyToUndef, z.coerce.number().optional()),
+  join_date: z.preprocess(emptyToUndef, z.string().optional()),
+  renewal_date: z.preprocess(emptyToUndef, z.string().optional()),
   status: z.enum(['active', 'inactive', 'pending']).default('active'),
   benefits: z.string().optional(),
-  user_id: z.string().uuid(),
+  user_id: z.string().uuid().optional(),
 });
 
 const updateSchema = schema.partial();

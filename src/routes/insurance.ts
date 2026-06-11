@@ -12,18 +12,26 @@ router.use(authMiddleware);
 router.use(sharedWriteGuard);
 router.use(auditLog);
 
+const emptyToUndef = (v: unknown) => (v === '' ? undefined : v);
+
 const schema = z.object({
-  policy_name: z.string().min(1),
+  policy_name: z.string().optional(),
   policy_type: z.string().optional(),
+  insurance_type: z.string().optional(),
   provider_name: z.string().optional(),
+  provider: z.string().optional(),
   policy_number: z.string().optional(),
-  coverage_amount: z.number().optional(),
-  premium_amount: z.number().optional(),
-  start_date: z.string(),
-  expiry_date: z.string(),
-  renewal_date: z.string().optional(),
+  coverage_amount: z.preprocess(emptyToUndef, z.coerce.number().optional()),
+  premium_amount: z.preprocess(emptyToUndef, z.coerce.number().optional()),
+  premium: z.preprocess(emptyToUndef, z.coerce.number().optional()),
+  start_date: z.preprocess(emptyToUndef, z.string().optional()),
+  expiry_date: z.preprocess(emptyToUndef, z.string().optional()),
+  end_date: z.preprocess(emptyToUndef, z.string().optional()),
+  renewal_date: z.preprocess(emptyToUndef, z.string().optional()),
   status: z.enum(['active', 'expired', 'pending_renewal']).default('active'),
   document_url: z.string().optional(),
+  agent_name: z.string().optional(),
+  agent_phone: z.string().optional(),
 });
 
 const updateSchema = schema.partial();

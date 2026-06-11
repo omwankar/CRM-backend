@@ -96,31 +96,6 @@ router.get('/me', async (req, res) => {
   res.json(data);
 });
 
-// GET /debug/me — debug endpoint to check session and user data
-router.get('/debug/me', async (req, res) => {
-  const userId = req.user?.id;
-  const userEmail = req.user?.email;
-  const userRole = req.user?.role;
-
-  // Fetch fresh data from DB
-  const { data: dbUser, error: dbError } = await supabase
-    .from('users')
-    .select('*')
-    .eq('id', userId)
-    .maybeSingle();
-
-  res.json({
-    fromToken: {
-      id: userId,
-      email: userEmail,
-      role: userRole,
-    },
-    fromDatabase: dbUser,
-    databaseError: dbError,
-    timestamp: new Date().toISOString(),
-  });
-});
-
 /**
  * POST / — instantly create a user (super_admin only).
  *

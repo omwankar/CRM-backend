@@ -4,7 +4,6 @@ import cors from "cors";
 import express from "express";
 
 import { loadEnv } from "./env.js";
-import { registerCustomerRoutes } from "./routes/customers.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerProjectRoutes } from "./routes/projects.js";
 import { registerCertificationRoutes } from "./routes/certifications.js";
@@ -28,23 +27,35 @@ import { registerAnnouncementRoutes } from "./routes/announcements.js";
 import { registerKnowledgeBaseRoutes } from "./routes/knowledgebase.js";
 import { registerReportRoutes } from "./routes/reports.js";
 import { registerTimeLogRoutes } from "./routes/timelogs.js";
+import { registerNotificationRoutes } from "./routes/notifications.js";
+import { registerLeadRoutes } from "./routes/leads.js";
+import { registerContactRoutes } from "./routes/contacts.js";
 
 const env = loadEnv();
 
 const app = express();
 app.disable("x-powered-by");
 
+const extraOrigins = (process.env.EXTRA_CORS_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+const allowedOrigins = new Set([env.FRONTEND_ORIGIN, ...extraOrigins]);
+
 app.use(
   cors({
-    origin: true,
+    origin(origin, callback) {
+      // Allow same-origin / server-to-server requests with no Origin header
+      if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+      callback(new Error("Not allowed by CORS"));
+    },
     credentials: true
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const api = express.Router();
 registerHealthRoutes(api);
-registerCustomerRoutes(api);
 registerProjectRoutes(api);
 registerCertificationRoutes(api);
 registerMembershipRoutes(api);
@@ -67,7 +78,22 @@ registerAnnouncementRoutes(api);
 registerKnowledgeBaseRoutes(api);
 registerReportRoutes(api);
 registerTimeLogRoutes(api);
+registerNotificationRoutes(api);
+registerLeadRoutes(api);
+registerContactRoutes(api);
 app.use("/api", api);
+
+// Global error handler — never leak stack traces to clients
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (err.message === "Not allowed by CORS") {
+    res.status(403).json({ error: "Origin not allowed" });
+    return;
+  }
+  console.error("Unhandled error:", err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 app.listen(env.PORT, () => {
   // eslint-disable-next-line no-console
