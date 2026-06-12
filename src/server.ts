@@ -38,16 +38,26 @@ app.disable("x-powered-by");
 
 const extraOrigins = (process.env.EXTRA_CORS_ORIGINS || "")
   .split(",")
-  .map((o) => o.trim())
+  .map((o) => o.trim().replace(/\/+$/, ""))
   .filter(Boolean);
-const allowedOrigins = new Set([env.FRONTEND_ORIGIN, ...extraOrigins]);
+
+function normalizeOrigin(origin: string) {
+  return origin.replace(/\/+$/, "");
+}
+
+const allowedOrigins = new Set([
+  normalizeOrigin(env.FRONTEND_ORIGIN),
+  ...extraOrigins.map(normalizeOrigin),
+]);
 
 app.use(
   cors({
     origin(origin, callback) {
       // Allow same-origin / server-to-server requests with no Origin header
-      if (!origin || allowedOrigins.has(origin)) return callback(null, true);
-      callback(new Error("Not allowed by CORS"));
+      if (!origin || allowedOrigins.has(normalizeOrigin(origin))) return callback(null, true);
+      console.warn(`[CORS] Blocked origin: ${origin}. Allowed: ${[...allowedOrigins].join(", ")}`);
+      // Do not pass an Error here — browsers treat failed CORS preflight as a network error
+      callback(null, false);
     },
     credentials: true
   })
@@ -85,10 +95,6 @@ app.use("/api", api);
 
 // Global error handler — never leak stack traces to clients
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  if (err.message === "Not allowed by CORS") {
-    res.status(403).json({ error: "Origin not allowed" });
-    return;
-  }
   console.error("Unhandled error:", err);
   if (!res.headersSent) {
     res.status(500).json({ error: "Internal server error" });
