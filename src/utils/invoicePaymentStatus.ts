@@ -13,7 +13,7 @@ export type InvoiceWorkflowStatus =
   | "cancelled";
 
 export function sumPayments(amounts: Array<number | string | null | undefined>): number {
-  const total = amounts.reduce((acc, a) => acc + Number(a || 0), 0);
+  const total = amounts.reduce<number>((acc, a) => acc + Number(a ?? 0), 0);
   return Math.round(total * 100) / 100;
 }
 

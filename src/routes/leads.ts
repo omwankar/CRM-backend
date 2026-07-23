@@ -67,7 +67,14 @@ async function recordAssignment(opts: {
   }
 }
 
-async function attachConvertedBuyer(lead: Record<string, unknown>) {
+async function attachConvertedBuyer(
+  lead: Record<string, unknown>,
+): Promise<
+  Record<string, unknown> & {
+    converted_buyer: { id: string; buyer_name: string | null; deleted_at: string | null } | null;
+    converted_buyer_archived: boolean;
+  }
+> {
   const buyerId = lead.converted_buyer_id as string | null;
   if (!buyerId) {
     return { ...lead, converted_buyer: null, converted_buyer_archived: false };
@@ -86,9 +93,9 @@ async function attachConvertedBuyer(lead: Record<string, unknown>) {
   return {
     ...lead,
     converted_buyer: {
-      id: buyer.id,
-      buyer_name: buyer.buyer_name,
-      deleted_at: buyer.deleted_at,
+      id: String(buyer.id),
+      buyer_name: (buyer.buyer_name as string | null) ?? null,
+      deleted_at: (buyer.deleted_at as string | null) ?? null,
     },
     converted_buyer_archived: Boolean(buyer.deleted_at),
   };

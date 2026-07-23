@@ -90,9 +90,10 @@ async function resolveLinkLabels(
   const load = async (type: string, table: string, nameCol: string) => {
     const ids = byType[type];
     if (!ids?.length) return;
-    const { data } = await supabase.from(table).select(`id, ${nameCol}`).in('id', ids);
-    for (const row of data || []) {
-      labelMap.set(`${type}:${row.id}`, (row as any)[nameCol] || '—');
+    // Dynamic column name — cast through unknown (Supabase can't type template selects)
+    const { data } = await supabase.from(table).select('*').in('id', ids);
+    for (const row of (data || []) as Array<Record<string, unknown>>) {
+      labelMap.set(`${type}:${String(row.id)}`, String(row[nameCol] || '—'));
     }
   };
 
