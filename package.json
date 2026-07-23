@@ -7,7 +7,17 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "provision-team": "tsx scripts/provision-team-users.ts",
+    "provision-team:execute": "tsx scripts/provision-team-users.ts --execute",
+    "seed:sales": "tsx scripts/seed-sales-demo.ts",
+    "seed:sales:clear": "tsx scripts/seed-sales-demo.ts --clear",
+    "seed:ops": "tsx scripts/seed-ops-demo.ts",
+    "seed:ops:clear": "tsx scripts/seed-ops-demo.ts --clear",
+    "seed:finance": "tsx scripts/seed-finance-demo.ts",
+    "seed:finance:clear": "tsx scripts/seed-finance-demo.ts --clear",
+    "seed:all": "tsx scripts/seed-all-demo.ts",
+    "seed:all:clear": "tsx scripts/seed-all-demo.ts --clear"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.1",
@@ -16,7 +26,6 @@
     "express": "^5.1.0",
     "node-cron": "^4.2.1",
     "pdfkit": "^0.18.0",
-    "resend": "^6.12.3",
     "zod": "^4.1.5"
   },
   "devDependencies": {

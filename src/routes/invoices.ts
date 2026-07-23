@@ -13,11 +13,13 @@ import {
 import { buildInvoicePdfBuffer, resolveInvoiceLogoPath, type InvoicePdfData } from "../services/invoicePdf.js";
 import { sendInvoiceEmail } from "../services/invoiceEmail.js";
 import { getQuotationCustomerPrice } from "../utils/quotationPricing.js";
+import { enrichInvoiceWithPayments } from "./payments.js";
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
-const invoiceStatus = z.enum(["draft", "sent", "paid", "overdue", "cancelled"]);
+const manualInvoiceStatus = z.enum(["draft", "sent", "cancelled"]);
+const invoiceStatusFilter = z.enum(["draft", "sent", "partial", "paid", "overdue", "cancelled"]);
 
 const lineItemSchema = z.object({
   description: z.string().min(1),
@@ -52,6 +54,7 @@ const taxSchema = z.object({
 const createSchema = z.object({
   buyer_id: z.string().uuid(),
   quotation_id: z.string().uuid().optional().nullable(),
+  opportunity_id: z.string().uuid().optional().nullable(),
   issue_date: z.string().optional(),
   due_date: z.string(),
   currency: z.string().min(3).max(3).default("INR"),
@@ -71,7 +74,8 @@ const fromQuotationSchema = z.object({
 });
 
 const updateSchema = createSchema.partial().extend({
-  status: invoiceStatus.optional(),
+  // Client may only set draft/sent/cancelled — paid/partial/overdue are payment-derived
+  status: manualInvoiceStatus.optional(),
 });
 
 router.use(authMiddleware);
@@ -198,16 +202,35 @@ async function fetchInvoiceDetail(id: string) {
       : [];
 
   let quotation: Record<string, unknown> | null = null;
+  let opportunityId = invoice.opportunity_id || null;
   if (invoice.quotation_id) {
     const { data: q } = await supabase
       .from("quotations")
-      .select("id, quotation_number, requirement, enquiry_title, standalone_project_name")
+      .select("id, quotation_number, requirement, enquiry_title, standalone_project_name, opportunity_id")
       .eq("id", invoice.quotation_id)
       .maybeSingle();
     quotation = q;
+    if (!opportunityId && q?.opportunity_id) opportunityId = q.opportunity_id;
   }
 
-  return { ...invoice, line_items: lines || [], buyer: buyer || null, taxes: taxRows, quotation };
+  const { data: payments } = await supabase
+    .from("payments")
+    .select("*")
+    .eq("invoice_id", id)
+    .is("deleted_at", null)
+    .order("payment_date", { ascending: false });
+
+  const base = {
+    ...invoice,
+    opportunity_id: opportunityId,
+    line_items: lines || [],
+    buyer: buyer || null,
+    taxes: taxRows,
+    quotation,
+    payments: payments || [],
+  };
+
+  return enrichInvoiceWithPayments(base);
 }
 
 async function buildPdfForInvoice(detail: NonNullable<Awaited<ReturnType<typeof fetchInvoiceDetail>>>) {
@@ -238,7 +261,7 @@ async function buildPdfForInvoice(detail: NonNullable<Awaited<ReturnType<typeof 
       }),
     ),
     logo_path: resolveInvoiceLogoPath(),
-    amount_paid: 0,
+    amount_paid: Number((detail as any).amount_paid || 0),
     buyer: {
       buyer_name: detail.buyer?.buyer_name || "Client",
       contact_person: detail.buyer?.contact_person,
@@ -293,7 +316,14 @@ router.get("/", async (req, res) => {
     .select("*, buyers(id, buyer_name, contact_email)", { count: "exact" })
     .is("deleted_at", null);
 
-  if (status) query = query.eq("status", status as string);
+  if (status) {
+    // Only apply DB filter for workflow statuses that are stored reliably;
+    // paid/partial/overdue are re-checked after enrichment below.
+    const s = String(status);
+    if (s === "draft" || s === "sent" || s === "cancelled") {
+      query = query.eq("status", s);
+    }
+  }
   if (buyer_id) query = query.eq("buyer_id", buyer_id as string);
   if (search) {
     const s = String(search).trim();
@@ -306,7 +336,25 @@ router.get("/", async (req, res) => {
 
   const { data, count, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
+
+  const enriched = await Promise.all((data || []).map((row) => enrichInvoiceWithPayments(row)));
+
+  // Optional post-filter by derived status (paid/partial/overdue)
+  let filtered = enriched;
+  if (status) {
+    const s = String(status);
+    if (invoiceStatusFilter.safeParse(s).success) {
+      filtered = enriched.filter((r) => r.status === s);
+    }
+  }
+
+  res.json({
+    data: filtered,
+    total: status ? filtered.length : count,
+    page: p,
+    limit: l,
+    totalPages: Math.ceil((status ? filtered.length : count || 0) / l),
+  });
 });
 
 // GET /api/invoices/settings/company
@@ -364,9 +412,15 @@ router.post("/", async (req, res) => {
   const invoice_number = await generateNextInvoiceNumber(supabase);
   const userId = req.user?.id;
 
+  let opportunityId = parsed.data.opportunity_id ?? null;
   if (quotation_id) {
-    const { data: q } = await supabase.from("quotations").select("id").eq("id", quotation_id).maybeSingle();
+    const { data: q } = await supabase
+      .from("quotations")
+      .select("id, opportunity_id")
+      .eq("id", quotation_id)
+      .maybeSingle();
     if (!q) return res.status(400).json({ error: "Linked quotation not found" });
+    if (!opportunityId) opportunityId = q.opportunity_id ?? null;
   }
 
   const { data: invoice, error: invErr } = await supabase
@@ -375,6 +429,7 @@ router.post("/", async (req, res) => {
       invoice_number,
       buyer_id,
       quotation_id: quotation_id ?? null,
+      opportunity_id: opportunityId,
       status: "draft",
       issue_date,
       due_date,
@@ -482,6 +537,7 @@ router.post("/from-quotation/:quotationId", async (req, res) => {
       invoice_number,
       buyer_id: parsed.data.buyer_id,
       quotation_id: quotation.id,
+      opportunity_id: quotation.opportunity_id || null,
       status: "draft",
       issue_date,
       due_date: due,

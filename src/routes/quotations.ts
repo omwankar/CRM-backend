@@ -7,6 +7,7 @@ import { buildQuotationPdfBuffer, type QuotationPdfData } from '../services/quot
 import { sendQuotationEmail } from '../services/quotationEmail.js';
 import { resolveInvoiceLogoPath } from '../services/invoicePdf.js';
 import { getQuotationCustomerPrice } from '../utils/quotationPricing.js';
+import { creditWarningIfExceeded } from '../utils/buyerCredit.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -36,8 +37,10 @@ const enquiryStage = z.enum([
 ]);
 
 const createQuotationSchema = z.object({
-  requirement: z.string().min(10),
-  status: quotationStatus,
+  enquiry_id: z.string().uuid(),
+  requirement: z.string().min(10).optional(), // inherited from enquiry if omitted
+  status: quotationStatus.optional(),
+  opportunity_id: z.string().uuid().optional().nullable(),
   enquiry_lead: z.string().uuid().optional().nullable(),
   project_id: z.string().uuid().optional().nullable(),
   standalone_project_name: z.string().trim().min(1).optional().nullable(),
@@ -50,9 +53,12 @@ const createQuotationSchema = z.object({
   priority: z.enum(['low', 'medium', 'high']).optional(),
   outcome: z.string().optional().nullable(),
   tracker_remarks: z.string().optional().nullable(),
+  buyer_id: z.string().uuid().optional().nullable(),
+  client_email: z.string().email().optional().nullable(),
 });
 
 const updateQuotationSchema = createQuotationSchema.partial().extend({
+  enquiry_id: z.string().uuid().optional(), // allow but prefer not to reparent
   buyer_id: z.string().uuid().optional().nullable(),
   client_email: z.string().email().optional().nullable(),
   chosen_quote_id: z.string().uuid().optional().nullable(),
@@ -63,6 +69,8 @@ const updateQuotationSchema = createQuotationSchema.partial().extend({
   revised_price: z.number().optional().nullable(),
   revised_currency: z.string().optional().nullable(),
   revised_notes: z.string().optional().nullable(),
+  requirement: z.string().min(10).optional(),
+  status: quotationStatus.optional(),
 });
 
 const sendQuotationSchema = z.object({
@@ -150,17 +158,6 @@ const vendorQuoteSchema = z.object({
   quote_file_url: z.string().max(2048).optional().nullable(),
   quote_line_status: z.enum(['under_review', 'sent', 'finalised']).optional(),
 });
-
-const followupCreateSchema = z.object({
-  followup_date: z.string(),
-  method: z.enum(['Call', 'Email', 'Meeting']),
-  customer_response: z.string().optional().nullable(),
-  next_followup_date: z.string().optional().nullable(),
-  reminder_status: z.enum(['completed', 'pending', 'not_set']).optional(),
-  vendor_quote_id: z.string().uuid().optional().nullable(),
-});
-
-const followupUpdateSchema = followupCreateSchema.partial();
 
 const revisionSchema = z.object({
   revised_price: z.number(),
@@ -358,146 +355,6 @@ router.get('/stats', async (req, res) => {
   }
 });
 
-// GET /api/quotations/:id/followups
-router.get('/:id/followups', async (req, res) => {
-  const { id } = req.params;
-  const vendorQuoteId = typeof req.query.vendor_quote_id === 'string' ? req.query.vendor_quote_id : null;
-  const { data: exists } = await supabase.from('quotations').select('id').eq('id', id).maybeSingle();
-  if (!exists) return res.status(404).json({ error: 'Not found' });
-
-  let query = supabase
-    .from('quotation_followups')
-    .select('*')
-    .eq('quotation_id', id)
-    .order('followup_date', { ascending: false });
-
-  if (vendorQuoteId) {
-    query = query.eq('vendor_quote_id', vendorQuoteId);
-  }
-
-  const { data: rows, error } = await query;
-
-  if (error) return res.status(500).json({ error: error.message });
-
-  const creatorIds = Array.from(new Set((rows || []).map((r: any) => r.created_by).filter(Boolean)));
-  const { data: creators } = creatorIds.length
-    ? await supabase.from('users').select('id, full_name').in('id', creatorIds)
-    : { data: [] as any[] };
-
-  const byCreator = new Map((creators || []).map((u: any) => [u.id, u]));
-
-  res.json({
-    data: (rows || []).map((r: any) => ({
-      ...r,
-      users: r.created_by ? byCreator.get(r.created_by) || null : null,
-    })),
-  });
-});
-
-// POST /api/quotations/:id/followups
-router.post('/:id/followups', async (req, res) => {
-  const userId = req.user?.id;
-  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-
-  const { id } = req.params;
-  const { data: exists } = await supabase.from('quotations').select('quotation_number').eq('id', id).maybeSingle();
-  if (!exists) return res.status(404).json({ error: 'Not found' });
-
-  const parsed = followupCreateSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
-
-  if (parsed.data.vendor_quote_id) {
-    const { data: vendorQuote, error: vendorQuoteError } = await supabase
-      .from('quotation_vendor_quotes')
-      .select('id')
-      .eq('id', parsed.data.vendor_quote_id)
-      .eq('quotation_id', id)
-      .maybeSingle();
-
-    if (vendorQuoteError) return res.status(500).json({ error: vendorQuoteError.message });
-    if (!vendorQuote) return res.status(400).json({ error: 'Invalid vendor quote for this enquiry' });
-  }
-
-  const { data, error } = await supabase
-    .from('quotation_followups')
-    .insert({
-      quotation_id: id,
-      vendor_quote_id: parsed.data.vendor_quote_id ?? null,
-      followup_date: parsed.data.followup_date,
-      method: parsed.data.method,
-      customer_response: parsed.data.customer_response ?? null,
-      next_followup_date: parsed.data.next_followup_date ?? null,
-      reminder_status: parsed.data.reminder_status ?? 'not_set',
-      created_by: userId,
-    })
-    .select()
-    .single();
-
-  if (error) return res.status(500).json({ error: error.message });
-
-  await logActivity(userId, `added follow-up on ${exists.quotation_number}`, id, { followup_id: data.id });
-
-  res.status(201).json(data);
-});
-
-// PUT /api/quotations/followups/:followupId
-router.put('/followups/:followupId', async (req, res) => {
-  const userId = req.user?.id;
-  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-
-  const parsed = followupUpdateSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
-
-  const clean: Record<string, unknown> = { ...parsed.data };
-  for (const k of Object.keys(clean)) {
-    if (clean[k] === '') clean[k] = null;
-  }
-
-  const { data, error } = await supabase
-    .from('quotation_followups')
-    .update(clean)
-    .eq('id', req.params.followupId)
-    .select()
-    .single();
-
-  if (error || !data) return res.status(404).json({ error: 'Not found' });
-
-  const { data: q } = await supabase.from('quotations').select('quotation_number').eq('id', data.quotation_id).maybeSingle();
-  if (q?.quotation_number) {
-    await logActivity(userId, `updated follow-up on ${q.quotation_number}`, data.quotation_id, { followup_id: data.id });
-  }
-
-  res.json(data);
-});
-
-// DELETE /api/quotations/followups/:followupId
-router.delete('/followups/:followupId', async (req, res) => {
-  const userId = req.user?.id;
-  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-  const role = req.user?.role;
-
-  const { data: row, error: fErr } = await supabase
-    .from('quotation_followups')
-    .select('id, created_by, quotation_id')
-    .eq('id', req.params.followupId)
-    .maybeSingle();
-
-  if (fErr) return res.status(500).json({ error: fErr.message });
-  if (!row) return res.status(404).json({ error: 'Not found' });
-  if (role !== 'super_admin' && row.created_by !== userId) return res.status(403).json({ error: 'Forbidden' });
-
-  const { data: q } = await supabase.from('quotations').select('quotation_number').eq('id', row.quotation_id).maybeSingle();
-
-  const { error } = await supabase.from('quotation_followups').delete().eq('id', row.id);
-  if (error) return res.status(500).json({ error: error.message });
-
-  if (q?.quotation_number) {
-    await logActivity(userId, `deleted follow-up on ${q.quotation_number}`, row.quotation_id, { followup_id: row.id });
-  }
-
-  res.json({ success: true });
-});
-
 // GET /api/quotations/:id
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
@@ -511,7 +368,7 @@ router.get('/:id', async (req, res) => {
   if (qErr) return res.status(500).json({ error: qErr.message });
   if (!quotation) return res.status(404).json({ error: 'Not found' });
 
-  const [vendorQuotes, revisions, leadUser, project, followupsRaw, updatedByUser, linkedInvoices, buyerRow] =
+  const [vendorQuotes, revisions, leadUser, project, updatedByUser, linkedInvoices, buyerRow, enquiryRow] =
     await Promise.all([
     supabase
       .from('quotation_vendor_quotes')
@@ -533,11 +390,6 @@ router.get('/:id', async (req, res) => {
     quotation.project_id
       ? supabase.from('projects').select('id, project_name').eq('id', quotation.project_id).maybeSingle()
       : Promise.resolve({ data: null as any, error: null as any }),
-    supabase
-      .from('quotation_followups')
-      .select('*')
-      .eq('quotation_id', id)
-      .order('followup_date', { ascending: false }),
     (quotation as any).updated_by
       ? supabase.from('users').select('id, full_name, email').eq('id', (quotation as any).updated_by).maybeSingle()
       : Promise.resolve({ data: null as any, error: null as any }),
@@ -555,37 +407,33 @@ router.get('/:id', async (req, res) => {
           .is('deleted_at', null)
           .maybeSingle()
       : Promise.resolve({ data: null as any, error: null as any }),
+    (quotation as any).enquiry_id
+      ? supabase
+          .from('enquiries')
+          .select('id, enquiry_number, title, stage, priority, deadline, client_budget, client_currency, opportunity_id, buyer_id')
+          .eq('id', (quotation as any).enquiry_id)
+          .maybeSingle()
+      : Promise.resolve({ data: null as any, error: null as any }),
   ]);
 
   if (vendorQuotes.error) return res.status(500).json({ error: vendorQuotes.error.message });
   if (revisions.error) return res.status(500).json({ error: revisions.error.message });
   if (leadUser.error) return res.status(500).json({ error: leadUser.error.message });
   if (project.error) return res.status(500).json({ error: project.error.message });
-  if (followupsRaw.error) return res.status(500).json({ error: followupsRaw.error.message });
   if (updatedByUser.error) return res.status(500).json({ error: updatedByUser.error.message });
   if (linkedInvoices.error) return res.status(500).json({ error: linkedInvoices.error.message });
   if (buyerRow.error) return res.status(500).json({ error: buyerRow.error.message });
-
-  const followRows = followupsRaw.data || [];
-  const creatorIds = Array.from(new Set(followRows.map((r: any) => r.created_by).filter(Boolean)));
-  const { data: creators } = creatorIds.length
-    ? await supabase.from('users').select('id, full_name').in('id', creatorIds)
-    : { data: [] as any[] };
-  const byCreator = new Map((creators || []).map((u: any) => [u.id, u]));
-  const quotation_followups = followRows.map((r: any) => ({
-    ...r,
-    users: r.created_by ? byCreator.get(r.created_by) || null : null,
-  }));
+  if (enquiryRow.error) return res.status(500).json({ error: enquiryRow.error.message });
 
   res.json({
     ...quotation,
     users: leadUser.data || null,
     projects: project.data || null,
     buyer: buyerRow.data || null,
+    enquiry: enquiryRow.data || null,
     linked_invoices: linkedInvoices.data || [],
     quotation_vendor_quotes: vendorQuotes.data || [],
     quotation_revisions: revisions.data || [],
-    quotation_followups,
     updated_by_user: updatedByUser.data || null,
   });
 });
@@ -686,6 +534,25 @@ router.post('/:id/send', async (req, res) => {
 
     if (updErr || !updated) return res.status(500).json({ error: updErr?.message || 'Failed to update quotation' });
 
+    // Advance linked enquiry stage to quote_sent when a quotation is emailed
+    if (quotation.enquiry_id) {
+      const { data: linkedEnquiry } = await supabase
+        .from('enquiries')
+        .select('id, stage')
+        .eq('id', quotation.enquiry_id)
+        .maybeSingle();
+
+      if (
+        linkedEnquiry &&
+        !['quote_sent', 'follow_up', 'won_closed', 'lost_closed'].includes(linkedEnquiry.stage)
+      ) {
+        await supabase
+          .from('enquiries')
+          .update({ stage: 'quote_sent', updated_by: userId })
+          .eq('id', linkedEnquiry.id);
+      }
+    }
+
     await logActivity(userId, `sent quotation ${quotation.quotation_number} to ${parsed.data.email}`, req.params.id, {
       email: parsed.data.email,
     });
@@ -696,7 +563,7 @@ router.post('/:id/send', async (req, res) => {
   }
 });
 
-// POST /api/quotations
+// POST /api/quotations — requires enquiry_id; inherits opportunity/buyer + denormalized enquiry fields
 router.post('/', async (req, res) => {
   const userId = req.user?.id;
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
@@ -704,22 +571,94 @@ router.post('/', async (req, res) => {
   const parsed = createQuotationSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
 
-  // Standalone requires budget
-  if (!parsed.data.project_id && (parsed.data.client_budget == null || Number.isNaN(parsed.data.client_budget as any))) {
-    return res.status(400).json({ error: 'client_budget is required for standalone quotations' });
+  const { data: enquiry, error: eErr } = await supabase
+    .from('enquiries')
+    .select('*')
+    .eq('id', parsed.data.enquiry_id)
+    .maybeSingle();
+  if (eErr) return res.status(500).json({ error: eErr.message });
+  if (!enquiry) return res.status(400).json({ error: 'Enquiry not found' });
+
+  const requirement =
+    parsed.data.requirement?.trim() ||
+    enquiry.requirement ||
+    '';
+  if (requirement.length < 10) {
+    return res.status(400).json({ error: 'Enquiry requirement must be at least 10 characters' });
   }
 
-  const { data, error } = await supabase
-    .from('quotations')
-    .insert({ ...parsed.data, created_by: userId })
-    .select()
-    .single();
+  let opportunityId = parsed.data.opportunity_id ?? enquiry.opportunity_id ?? null;
+  let buyerId = parsed.data.buyer_id ?? enquiry.buyer_id ?? null;
 
+  if (opportunityId) {
+    const { data: opp } = await supabase
+      .from('opportunities')
+      .select('id, buyer_id')
+      .eq('id', opportunityId)
+      .maybeSingle();
+    if (opp?.buyer_id) buyerId = opp.buyer_id;
+  }
+
+  const payload: Record<string, unknown> = {
+    enquiry_id: enquiry.id,
+    opportunity_id: opportunityId,
+    buyer_id: buyerId,
+    requirement,
+    status: parsed.data.status || 'waiting_from_companies',
+    enquiry_lead: parsed.data.enquiry_lead ?? enquiry.owner_id ?? userId,
+    project_id: parsed.data.project_id ?? enquiry.project_id,
+    standalone_project_name: parsed.data.standalone_project_name ?? enquiry.standalone_project_name,
+    client_budget: parsed.data.client_budget ?? enquiry.client_budget,
+    client_currency: parsed.data.client_currency ?? enquiry.client_currency ?? 'INR',
+    client_price_notes: parsed.data.client_price_notes ?? enquiry.client_price_notes,
+    deadline: parsed.data.deadline ?? enquiry.deadline,
+    enquiry_title:
+      parsed.data.enquiry_title ??
+      enquiry.title ??
+      enquiry.prospect_name ??
+      enquiry.standalone_project_name,
+    enquiry_stage:
+      parsed.data.enquiry_stage ??
+      (enquiry.stage === 'new_enquiry' || enquiry.stage === 'under_review' ? 'preparing' : enquiry.stage),
+    priority: parsed.data.priority ?? enquiry.priority ?? 'medium',
+    outcome: parsed.data.outcome ?? null,
+    tracker_remarks: parsed.data.tracker_remarks ?? enquiry.notes,
+    client_email: parsed.data.client_email ?? enquiry.client_email,
+    created_by: userId,
+    updated_by: userId,
+  };
+
+  if (!payload.project_id && (payload.client_budget == null || Number.isNaN(Number(payload.client_budget)))) {
+    return res.status(400).json({
+      error: 'Client budget is required when the enquiry has no project',
+    });
+  }
+
+  const { data, error } = await supabase.from('quotations').insert(payload).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
-  await logActivity(userId, `created quotation ${data.quotation_number}`, data.id);
+  const estimated =
+    payload.client_budget != null && !Number.isNaN(Number(payload.client_budget))
+      ? Number(payload.client_budget)
+      : null;
+  const credit_warning = await creditWarningIfExceeded(
+    buyerId ? String(buyerId) : null,
+    estimated,
+  );
 
-  res.status(201).json(data);
+  // Advance early enquiry stages to preparing (never regress quote_sent+)
+  if (enquiry.stage === 'new_enquiry' || enquiry.stage === 'under_review') {
+    await supabase
+      .from('enquiries')
+      .update({ stage: 'preparing', updated_by: userId })
+      .eq('id', enquiry.id);
+  }
+
+  await logActivity(userId, `created quotation ${data.quotation_number}`, data.id, {
+    enquiry_id: enquiry.id,
+  });
+
+  res.status(201).json({ ...data, ...(credit_warning ? { credit_warning } : {}) });
 });
 
 // PUT /api/quotations/:id

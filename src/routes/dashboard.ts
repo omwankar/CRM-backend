@@ -106,7 +106,7 @@ router.get('/stats', async (req, res) => {
       .from('tasks')
       .select('id, task_title, due_date, status')
       .eq('assigned_person_id', userId)
-      .in('status', ['Pending', 'In Progress', 'On Hold'])
+      .in('status', ['pending', 'in_progress', 'Pending', 'In Progress', 'On Hold'])
       .is('deleted_at', null)
       .order('due_date', { ascending: true })
       .limit(10);

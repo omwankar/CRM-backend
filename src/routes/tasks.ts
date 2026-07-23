@@ -2,668 +2,556 @@ import express from 'express';
 import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
-import { taskWriteGuard } from '../middleware/requireRole.js';
+import { auditLog } from '../middleware/auditLog.js';
 
 const router = express.Router();
-
-// Initialize Supabase client
-const supabaseUrl = process.env.SUPABASE_URL!;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
 router.use(authMiddleware);
-// Tasks are read-public, write-restricted: managers/super_admin always; a
-// plain `user` may modify only tasks they are assigned to / supervise / created.
-router.use(taskWriteGuard);
+router.use(auditLog);
 
-// Validation schemas
-const createTaskSchema = z.object({
-  task_title: z.string().min(1, 'Task title is required'),
-  task_type: z.enum(['admin', 'sales']),
-  project_id: z.string().uuid().nullable().optional(),
-  assigned_person_id: z.string().uuid().nullable().optional(),
-  supervisor_id: z.string().uuid().nullable().optional(),
-  assigned_date: z.string().optional(),
+export const TASK_ENTITY_TYPES = [
+  'lead',
+  'opportunity',
+  'enquiry',
+  'quotation',
+  'buyer',
+  'vendor',
+  'job',
+  'project',
+  'invoice',
+  'contact',
+  'company',
+] as const;
+
+export const TASK_STATUSES = ['pending', 'in_progress', 'completed', 'cancelled'] as const;
+export const TASK_PRIORITIES = ['low', 'medium', 'high'] as const;
+
+const SALES_TYPES = ['lead', 'opportunity', 'enquiry', 'quotation', 'buyer', 'contact', 'company'] as const;
+const OPS_TYPES = ['job', 'project', 'vendor'] as const;
+const FINANCE_TYPES = ['invoice'] as const;
+
+const createSchema = z.object({
+  title: z.string().trim().min(1).optional(),
+  task_title: z.string().trim().min(1).optional(), // legacy alias
+  description: z.string().optional().nullable(),
+  notes: z.string().optional().nullable(), // legacy alias for description
+  entity_type: z.enum(TASK_ENTITY_TYPES).optional().nullable(),
+  entity_id: z.string().uuid().optional().nullable(),
+  project_id: z.string().uuid().optional().nullable(), // legacy → project entity
+  assignee_id: z.string().uuid().optional(),
+  assigned_person_id: z.string().uuid().optional(), // legacy alias
+  supervisor_id: z.string().uuid().optional().nullable(),
+  due_date: z.string().min(1),
+  priority: z.enum(TASK_PRIORITIES).optional(),
+  status: z.enum(TASK_STATUSES).optional(),
+  task_type: z.enum(['admin', 'sales']).optional(), // legacy, ignored for filtering
+}).refine((d) => Boolean(d.title || d.task_title), { message: 'Title is required', path: ['title'] })
+  .refine((d) => Boolean(d.assignee_id || d.assigned_person_id), {
+    message: 'Assignee is required',
+    path: ['assignee_id'],
+  })
+  .refine(
+    (d) => {
+      const et = d.entity_type ?? (d.project_id ? 'project' : null);
+      const eid = d.entity_id ?? d.project_id ?? null;
+      if (et && !eid) return false;
+      if (!et && eid) return false;
+      return true;
+    },
+    { message: 'entity_type and entity_id must be set together', path: ['entity_id'] },
+  );
+
+const updateSchema = z.object({
+  title: z.string().trim().min(1).optional(),
+  task_title: z.string().trim().min(1).optional(),
+  description: z.string().optional().nullable(),
+  notes: z.string().optional().nullable(),
+  entity_type: z.enum(TASK_ENTITY_TYPES).optional().nullable(),
+  entity_id: z.string().uuid().optional().nullable(),
+  project_id: z.string().uuid().optional().nullable(),
+  assignee_id: z.string().uuid().optional(),
+  assigned_person_id: z.string().uuid().optional(),
+  supervisor_id: z.string().uuid().optional().nullable(),
   due_date: z.string().optional(),
-  status: z.enum(['Pending', 'In Progress', 'On Hold', 'Completed', 'Cancelled']).default('Pending'),
-  notes: z.string().optional(),
-  linked_email: z.string().email().optional().or(z.literal('')),
-  created_by: z.string().uuid(),
-}).refine(
-  (data) => data.task_type !== 'sales' || data.project_id,
-  { message: 'Project is required for sales tasks', path: ['project_id'] }
-);
-
-const updateTaskSchema = z.object({
-  task_title: z.string().min(1).optional(),
-  task_type: z.enum(['admin', 'sales']).optional(),
-  project_id: z.string().uuid().nullable().optional(),
-  assigned_person_id: z.string().uuid().nullable().optional(),
-  supervisor_id: z.string().uuid().nullable().optional(),
-  assigned_date: z.string().optional(),
-  due_date: z.string().optional(),
-  status: z.enum(['Pending', 'In Progress', 'On Hold', 'Completed', 'Cancelled']).optional(),
-  notes: z.string().optional(),
-  linked_email: z.string().email().optional().or(z.literal('')),
-}).refine(
-  (data) => {
-    if (data.task_type === 'sales' && data.project_id === null) return false;
-    return true;
-  },
-  { message: 'Project is required for sales tasks', path: ['project_id'] }
-);
-
-const changeStatusSchema = z.object({
-  status: z.enum(['Pending', 'In Progress', 'On Hold', 'Completed', 'Cancelled']),
-  reason: z.string().min(1, 'Reason is required'),
-  changed_by: z.string().uuid().optional(),
+  priority: z.enum(TASK_PRIORITIES).optional(),
+  status: z.enum(TASK_STATUSES).optional(),
 });
 
-const addEmployeeSchema = z.object({
-  user_id: z.string().uuid(),
-  role: z.enum(['admin', 'assigned', 'viewer']),
+const completeSchema = z.object({
+  log_activity: z.boolean().optional(),
+  activity_type: z.enum(['call', 'email', 'meeting', 'note']).optional(),
+  activity_subject: z.string().optional().nullable(),
+  activity_notes: z.string().optional().nullable(),
 });
 
-// GET /api/tasks - List all tasks with filters
+function isPrivileged(role?: string) {
+  return role === 'manager' || role === 'super_admin';
+}
+
+function isOverdue(task: { status: string; due_date: string | null }) {
+  if (task.status === 'completed' || task.status === 'cancelled' || !task.due_date) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const due = new Date(task.due_date);
+  due.setHours(0, 0, 0, 0);
+  return due < today;
+}
+
+async function notify(userId: string | null | undefined, title: string, message: string) {
+  if (!userId) return;
+  await supabase.from('notifications').insert({
+    user_id: userId,
+    type: 'task',
+    title,
+    message,
+  });
+}
+
+async function enrichTasks(tasks: any[]) {
+  if (!tasks.length) return [];
+
+  const personIds = new Set<string>();
+  const projectIds = new Set<string>();
+  const jobIds = new Set<string>();
+  for (const t of tasks) {
+    if (t.assigned_person_id) personIds.add(t.assigned_person_id);
+    if (t.supervisor_id) personIds.add(t.supervisor_id);
+    if (t.created_by) personIds.add(t.created_by);
+    if (t.entity_type === 'project' && t.entity_id) projectIds.add(t.entity_id);
+    else if (t.entity_type === 'job' && t.entity_id) jobIds.add(t.entity_id);
+    else if (t.project_id) projectIds.add(t.project_id);
+  }
+
+  let usersById: Record<string, any> = {};
+  if (personIds.size) {
+    const { data } = await supabase
+      .from('users')
+      .select('id, email, full_name')
+      .in('id', [...personIds]);
+    usersById = (data || []).reduce((acc: any, u: any) => {
+      acc[u.id] = u;
+      return acc;
+    }, {});
+  }
+
+  let projectsById: Record<string, any> = {};
+  if (projectIds.size) {
+    const { data } = await supabase
+      .from('projects')
+      .select('id, project_id, project_name')
+      .in('id', [...projectIds]);
+    projectsById = (data || []).reduce((acc: any, p: any) => {
+      acc[p.id] = p;
+      return acc;
+    }, {});
+  }
+
+  let jobsById: Record<string, any> = {};
+  if (jobIds.size) {
+    const { data } = await supabase
+      .from('jobs')
+      .select('id, job_number, title')
+      .in('id', [...jobIds]);
+    jobsById = (data || []).reduce((acc: any, j: any) => {
+      acc[j.id] = j;
+      return acc;
+    }, {});
+  }
+
+  return tasks.map((t) => {
+    const assignee = t.assigned_person_id ? usersById[t.assigned_person_id] : null;
+    const supervisor = t.supervisor_id ? usersById[t.supervisor_id] : null;
+    const creator = t.created_by ? usersById[t.created_by] : null;
+    const projectKey = t.entity_type === 'project' ? t.entity_id : t.project_id;
+    const project = projectKey ? projectsById[projectKey] : null;
+    const job = t.entity_type === 'job' && t.entity_id ? jobsById[t.entity_id] : null;
+    return {
+      ...t,
+      title: t.task_title,
+      description: t.notes,
+      assignee_id: t.assigned_person_id,
+      overdue: isOverdue(t),
+      assignee: assignee
+        ? { id: assignee.id, name: assignee.full_name || assignee.email || 'Unknown', email: assignee.email || '' }
+        : null,
+      supervisor: supervisor
+        ? {
+            id: supervisor.id,
+            name: supervisor.full_name || supervisor.email || 'Unknown',
+            email: supervisor.email || '',
+          }
+        : null,
+      creator: creator
+        ? { id: creator.id, name: creator.full_name || creator.email || 'Unknown', email: creator.email || '' }
+        : null,
+      project: project
+        ? { id: project.id, project_id: project.project_id, project_name: project.project_name }
+        : null,
+      job: job ? { id: job.id, job_number: job.job_number, title: job.title } : null,
+      entity_label: job
+        ? `${job.job_number} · ${job.title}`
+        : project
+          ? project.project_name || project.project_id
+          : null,
+    };
+  });
+}
+
+function canComplete(task: any, userId?: string, role?: string) {
+  if (!userId) return false;
+  if (isPrivileged(role)) return true;
+  return task.assigned_person_id === userId || task.supervisor_id === userId;
+}
+
+function canDelete(task: any, userId?: string, role?: string) {
+  if (!userId) return false;
+  if (isPrivileged(role)) return true;
+  return task.created_by === userId || task.supervisor_id === userId;
+}
+
+function canEdit(task: any, userId?: string, role?: string) {
+  if (!userId) return false;
+  if (isPrivileged(role)) return true;
+  return (
+    task.assigned_person_id === userId ||
+    task.supervisor_id === userId ||
+    task.created_by === userId
+  );
+}
+
+// GET /api/tasks
 router.get('/', async (req, res) => {
-  try {
-    const { status, task_type, search, project_id, start_date, end_date, sort_by, sort_order, page = '1', limit = '20' } = req.query;
+  const {
+    view = 'mine',
+    status,
+    priority,
+    overdue,
+    search,
+    entity_type,
+    entity_id,
+    assignee_id,
+    page = '1',
+    limit = '50',
+  } = req.query;
 
-    const pageNum = parseInt(page as string);
-    const limitNum = parseInt(limit as string);
-    const offset = (pageNum - 1) * limitNum;
+  const userId = req.user?.id;
+  const role = req.user?.role;
+  const p = Math.max(1, Number(page));
+  const l = Math.min(200, Number(limit) || 50);
 
-    let query = supabase
-      .from('tasks')
-      .select('*', { count: 'exact' })
-      .is('deleted_at', null);
-
-    // Apply filters
-    if (status) {
-      query = query.eq('status', status);
-    }
-
-    if (task_type) {
-      query = query.eq('task_type', task_type);
-    }
-
-    if (project_id) {
-      query = query.eq('project_id', project_id);
-    }
-
-    if (search) {
-      query = query.or(`task_title.ilike.%${search}%,task_id.ilike.%${search}%`);
-    }
-
-    if (start_date) {
-      query = query.gte('assigned_date', start_date);
-    }
-
-    if (end_date) {
-      query = query.lte('due_date', end_date);
-    }
-
-    // Apply sorting
-    const allowedSortColumns = new Set(['created_at', 'due_date', 'assigned_date', 'task_title']);
-    const requestedSortBy = (sort_by as string) || 'created_at';
-    const sortBy = allowedSortColumns.has(requestedSortBy) ? requestedSortBy : 'created_at';
-    const sortOrder = sort_order as string || 'desc';
-    query = query.order(sortBy, { ascending: sortOrder === 'asc' });
-
-    // Apply pagination
-    query = query.range(offset, offset + limitNum - 1);
-
-    const { data, error, count } = await query;
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    const tasks = data || [];
-
-    // Enrich with person and project info
-    const personIds = new Set<string>();
-    const projectIds = new Set<string>();
-    tasks.forEach((task: any) => {
-      if (task.assigned_person_id) personIds.add(task.assigned_person_id);
-      if (task.supervisor_id) personIds.add(task.supervisor_id);
-      if (task.project_id) projectIds.add(task.project_id);
-    });
-
-    let usersById: Record<string, any> = {};
-    if (personIds.size > 0) {
-      const { data: usersData } = await supabase
-        .from('users')
-        .select('id, email, full_name')
-        .in('id', Array.from(personIds));
-
-      usersById = (usersData || []).reduce((acc: Record<string, any>, user: any) => {
-        acc[user.id] = user;
-        return acc;
-      }, {});
-    }
-
-    let projectsById: Record<string, any> = {};
-    if (projectIds.size > 0) {
-      const { data: projectsData } = await supabase
-        .from('projects')
-        .select('id, project_id, project_name')
-        .in('id', Array.from(projectIds));
-
-      projectsById = (projectsData || []).reduce((acc: Record<string, any>, p: any) => {
-        acc[p.id] = p;
-        return acc;
-      }, {});
-    }
-
-    const enrichedTasks = tasks.map((task: any) => {
-      const assigned = task.assigned_person_id ? usersById[task.assigned_person_id] : null;
-      const supervisor = task.supervisor_id ? usersById[task.supervisor_id] : null;
-      const project = task.project_id ? projectsById[task.project_id] : null;
-
-      return {
-        ...task,
-        assigned_person: assigned
-          ? { id: assigned.id, name: assigned.full_name || assigned.email || 'Unknown', email: assigned.email || '' }
-          : null,
-        supervisor: supervisor
-          ? { id: supervisor.id, name: supervisor.full_name || supervisor.email || 'Unknown', email: supervisor.email || '' }
-          : null,
-        project: project
-          ? { id: project.id, project_id: project.project_id, project_name: project.project_name }
-          : null,
-      };
-    });
-
-    res.json({
-      tasks: enrichedTasks,
-      total: count || 0,
-      page: pageNum,
-      limit: limitNum,
-      totalPages: Math.ceil((count || 0) / limitNum),
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+  if (view === 'team' && !isPrivileged(role)) {
+    return res.status(403).json({ error: 'Team view requires manager access' });
   }
+
+  let query = supabase.from('tasks').select('*', { count: 'exact' }).is('deleted_at', null);
+
+  if (view === 'mine') {
+    query = query.eq('assigned_person_id', userId!);
+  } else if (view === 'sales') {
+    query = query.in('entity_type', [...SALES_TYPES]);
+  } else if (view === 'operations') {
+    query = query.in('entity_type', [...OPS_TYPES]);
+  } else if (view === 'finance') {
+    query = query.in('entity_type', [...FINANCE_TYPES]);
+  } else if (view === 'team') {
+    // all tasks
+  } else if (view === 'entity') {
+    if (!entity_type || !entity_id) {
+      return res.status(400).json({ error: 'entity_type and entity_id required for entity view' });
+    }
+    query = query.eq('entity_type', String(entity_type)).eq('entity_id', String(entity_id));
+  }
+
+  if (status && status !== 'all') query = query.eq('status', String(status));
+  if (priority && priority !== 'all') query = query.eq('priority', String(priority));
+  if (assignee_id) query = query.eq('assigned_person_id', String(assignee_id));
+  if (entity_type && view !== 'entity') query = query.eq('entity_type', String(entity_type));
+  if (entity_id && view !== 'entity') query = query.eq('entity_id', String(entity_id));
+
+  if (search) {
+    const s = String(search).replace(/[%_,()]/g, ' ').trim();
+    if (s) query = query.or(`task_title.ilike.%${s}%,notes.ilike.%${s}%,task_id.ilike.%${s}%`);
+  }
+
+  if (overdue === '1' || overdue === 'true') {
+    const today = new Date().toISOString().slice(0, 10);
+    query = query
+      .lt('due_date', today)
+      .not('status', 'in', '("completed","cancelled")');
+  }
+
+  query = query.order('due_date', { ascending: true }).range((p - 1) * l, p * l - 1);
+
+  const { data, count, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+
+  const enriched = await enrichTasks(data || []);
+  res.json({
+    data: enriched,
+    tasks: enriched, // legacy key
+    total: count || 0,
+    page: p,
+    limit: l,
+    totalPages: Math.ceil((count || 0) / l),
+  });
 });
 
-// GET /api/tasks/:id - Get single task with relations
+// GET /api/tasks/:id
 router.get('/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { data: task, error: taskError } = await supabase
-      .from('tasks')
-      .select('*')
-      .eq('id', id)
-      .is('deleted_at', null)
-      .single();
-
-    if (taskError || !task) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-
-    // Fetch assigned person details
-    let assignedPerson = null;
-    if (task.assigned_person_id) {
-      const { data: apUser } = await supabase
-        .from('users')
-        .select('id, email, full_name')
-        .eq('id', task.assigned_person_id)
-        .maybeSingle();
-      if (apUser) {
-        assignedPerson = { id: apUser.id, name: apUser.full_name || apUser.email || 'Unknown', email: apUser.email || '' };
-      }
-    }
-
-    // Fetch supervisor details
-    let supervisor = null;
-    if (task.supervisor_id) {
-      const { data: supUser } = await supabase
-        .from('users')
-        .select('id, email, full_name')
-        .eq('id', task.supervisor_id)
-        .maybeSingle();
-      if (supUser) {
-        supervisor = { id: supUser.id, name: supUser.full_name || supUser.email || 'Unknown', email: supUser.email || '' };
-      }
-    }
-
-    // Fetch project info
-    let project = null;
-    if (task.project_id) {
-      const { data: proj } = await supabase
-        .from('projects')
-        .select('id, project_id, project_name')
-        .eq('id', task.project_id)
-        .maybeSingle();
-      if (proj) {
-        project = { id: proj.id, project_id: proj.project_id, project_name: proj.project_name };
-      }
-    }
-
-    // Get attachments
-    const { data: attachments } = await supabase
-      .from('task_attachments')
-      .select('*')
-      .eq('task_id', id)
-      .order('created_at', { ascending: false });
-
-    // Get emails
-    const { data: emails } = await supabase
-      .from('task_emails')
-      .select('*')
-      .eq('task_id', id)
-      .order('received_at', { ascending: false });
-
-    // Get employees
-    const { data: employees } = await supabase
-      .from('task_employees')
-      .select('id, user_id, role, added_at')
-      .eq('task_id', id);
-
-    // Fetch employee user details
-    const employeeUserIds = Array.from(new Set((employees || []).map((e: any) => e.user_id).filter(Boolean)));
-    let employeeUsersById: Record<string, { id: string; email?: string | null; full_name?: string | null }> = {};
-    if (employeeUserIds.length > 0) {
-      const { data: usersData } = await supabase
-        .from('users')
-        .select('id, email, full_name')
-        .in('id', employeeUserIds);
-      employeeUsersById = (usersData || []).reduce((acc: Record<string, any>, user: any) => {
-        acc[user.id] = user;
-        return acc;
-      }, {});
-    }
-
-    // Format employees with avatar initials
-    const formattedEmployees = (employees || []).map((emp: any) => {
-      const profile = employeeUsersById[emp.user_id];
-      const displayName = profile?.full_name || profile?.email || 'Unknown';
-      const initials = displayName.split(' ').map((n: string) => n[0]).join('').toUpperCase().slice(0, 2);
-      return {
-        id: emp.id,
-        user_id: emp.user_id,
-        name: displayName,
-        email: profile?.email || '',
-        role: emp.role,
-        avatar_initials: initials,
-        added_at: emp.added_at,
-      };
-    });
-
-    res.json({
-      ...task,
-      assigned_person: assignedPerson,
-      supervisor: supervisor,
-      project: project,
-      employees: formattedEmployees,
-      attachments: attachments || [],
-      emails: emails || [],
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  const { data, error } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (error || !data) return res.status(404).json({ error: 'Task not found' });
+  const [enriched] = await enrichTasks([data]);
+  res.json(enriched);
 });
 
-// POST /api/tasks - Create new task
+// POST /api/tasks
 router.post('/', async (req, res) => {
-  try {
-    const body = createTaskSchema.parse(req.body);
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    // Generate task_id
-    const { data: lastTask } = await supabase
-      .from('tasks')
-      .select('task_id')
-      .order('task_id', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    let nextNum = 1;
-    if (lastTask?.task_id) {
-      const numPart = lastTask.task_id.replace('TASK-', '');
-      nextNum = parseInt(numPart) + 1;
-    }
-    const taskId = `TASK-${String(nextNum).padStart(4, '0')}`;
-
-    const { data, error } = await supabase
-      .from('tasks')
-      .insert({ ...body, task_id: taskId })
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    // Add initial status history
-    await supabase
-      .from('task_status_history')
-      .insert({
-        task_id: data.id,
-        old_status: null,
-        new_status: body.status,
-        reason: 'Task created',
-        changed_by: body.created_by,
-      });
-
-    // Add creator as admin employee
-    await supabase
-      .from('task_employees')
-      .insert({
-        task_id: data.id,
-        user_id: body.created_by,
-        role: 'admin',
-      });
-
-    res.status(201).json(data);
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: error.issues });
-    }
-    res.status(500).json({ error: 'Internal server error' });
+  const parsed = createSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
   }
+
+  const body = parsed.data;
+  const title = (body.title || body.task_title || '').trim();
+  const assignee = body.assignee_id || body.assigned_person_id!;
+  let entityType = body.entity_type ?? null;
+  let entityId = body.entity_id ?? null;
+  if (!entityType && body.project_id) {
+    entityType = 'project';
+    entityId = body.project_id;
+  }
+
+  const row: Record<string, unknown> = {
+    task_title: title,
+    notes: body.description ?? body.notes ?? null,
+    assigned_person_id: assignee,
+    supervisor_id: body.supervisor_id ?? null,
+    due_date: body.due_date,
+    priority: body.priority || 'medium',
+    status: body.status || 'pending',
+    entity_type: entityType,
+    entity_id: entityId,
+    project_id: entityType === 'project' ? entityId : body.project_id ?? null,
+    task_type: entityType && (SALES_TYPES as readonly string[]).includes(entityType) ? 'sales' : 'admin',
+    assigned_date: new Date().toISOString().slice(0, 10),
+    created_by: userId,
+  };
+
+  const { data, error } = await supabase.from('tasks').insert(row).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  if (assignee !== userId) {
+    await notify(assignee, 'New task assigned', `"${title}" was assigned to you.`);
+  }
+
+  const [enriched] = await enrichTasks([data]);
+  res.status(201).json(enriched);
 });
 
-// PUT /api/tasks/:id - Update task
+// PUT /api/tasks/:id
 router.put('/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const body = updateTaskSchema.parse(req.body);
+  const userId = req.user?.id;
+  const role = req.user?.role;
 
-    const { data, error } = await supabase
-      .from('tasks')
-      .update(body)
-      .eq('id', id)
-      .is('deleted_at', null)
-      .select()
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-
-    res.json(data);
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: error.issues });
-    }
-    res.status(500).json({ error: 'Internal server error' });
+  const { data: existing } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!existing) return res.status(404).json({ error: 'Task not found' });
+  if (!canEdit(existing, userId, role)) {
+    return res.status(403).json({ error: 'You can only edit tasks you own, supervise, or created' });
   }
-});
 
-// DELETE /api/tasks/:id - Soft delete
-router.delete('/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from('tasks')
-      .update({ deleted_at: new Date().toISOString() })
-      .eq('id', id)
-      .is('deleted_at', null)
-      .select()
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-
-    res.json({ message: 'Task deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+  const parsed = updateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
   }
-});
 
-// POST /api/tasks/:id/status - Change status
-router.post('/:id/status', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const body = changeStatusSchema.parse(req.body);
-    const actorId = body.changed_by || req.user?.id;
-    if (!actorId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+  const body = parsed.data;
+  const patch: Record<string, unknown> = {};
 
-    // Get current status
-    const { data: currentTask } = await supabase
-      .from('tasks')
-      .select('status')
-      .eq('id', id)
-      .is('deleted_at', null)
-      .single();
-
-    if (!currentTask) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-
-    // Update status
-    const { data, error } = await supabase
-      .from('tasks')
-      .update({ status: body.status })
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    // Add to status history
-    await supabase
-      .from('task_status_history')
-      .insert({
-        task_id: id,
-        old_status: currentTask.status,
-        new_status: body.status,
-        reason: body.reason,
-        changed_by: actorId,
-      });
-
-    res.json(data);
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: error.issues });
-    }
-    res.status(500).json({ error: 'Internal server error' });
+  if (body.title || body.task_title) patch.task_title = body.title || body.task_title;
+  if (body.description !== undefined || body.notes !== undefined) {
+    patch.notes = body.description ?? body.notes ?? null;
   }
-});
+  if (body.assignee_id || body.assigned_person_id) {
+    patch.assigned_person_id = body.assignee_id || body.assigned_person_id;
+  }
+  if (body.supervisor_id !== undefined) patch.supervisor_id = body.supervisor_id;
+  if (body.due_date) patch.due_date = body.due_date;
+  if (body.priority) patch.priority = body.priority;
 
-// GET /api/tasks/:id/history - Get status change history
-router.get('/:id/history', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from('task_status_history')
-      .select('id, old_status, new_status, reason, changed_by, changed_at')
-      .eq('task_id', id)
-      .order('changed_at', { ascending: false });
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
+  if (body.entity_type !== undefined || body.entity_id !== undefined || body.project_id !== undefined) {
+    let et = body.entity_type !== undefined ? body.entity_type : existing.entity_type;
+    let eid = body.entity_id !== undefined ? body.entity_id : existing.entity_id;
+    if (body.project_id) {
+      et = 'project';
+      eid = body.project_id;
     }
+    patch.entity_type = et;
+    patch.entity_id = eid;
+    patch.project_id = et === 'project' ? eid : null;
+  }
 
-    const changedByIds = Array.from(
-      new Set((data || []).map((h: any) => h.changed_by).filter(Boolean))
+  if (body.status) {
+    if (body.status === 'completed' && existing.status !== 'completed') {
+      if (!canComplete(existing, userId, role)) {
+        return res.status(403).json({ error: 'Only assignee, supervisor, or manager can complete this task' });
+      }
+      patch.status = 'completed';
+      patch.completed_at = new Date().toISOString();
+    } else {
+      patch.status = body.status;
+      if (body.status !== 'completed') patch.completed_at = null;
+    }
+  }
+
+  const prevAssignee = existing.assigned_person_id;
+  const { data, error } = await supabase
+    .from('tasks')
+    .update(patch)
+    .eq('id', req.params.id)
+    .select()
+    .single();
+  if (error || !data) return res.status(500).json({ error: error?.message || 'Update failed' });
+
+  if (patch.assigned_person_id && patch.assigned_person_id !== prevAssignee) {
+    await notify(
+      String(patch.assigned_person_id),
+      'Task assigned to you',
+      `"${data.task_title}" was assigned to you.`,
     );
-
-    let usersById: Record<string, { full_name?: string | null; email?: string | null }> = {};
-    if (changedByIds.length > 0) {
-      const { data: usersData } = await supabase
-        .from('users')
-        .select('id, full_name, email')
-        .in('id', changedByIds);
-
-      usersById = (usersData || []).reduce((acc: Record<string, any>, user: any) => {
-        acc[user.id] = user;
-        return acc;
-      }, {});
-    }
-
-    const formattedHistory = (data || []).map((h: any) => ({
-      id: h.id,
-      old_status: h.old_status,
-      new_status: h.new_status,
-      reason: h.reason,
-      changed_by_name:
-        usersById[h.changed_by]?.full_name ||
-        usersById[h.changed_by]?.email ||
-        'Unknown',
-      changed_at: h.changed_at,
-    }));
-
-    res.json(formattedHistory);
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
   }
+
+  if (patch.status === 'completed' && existing.supervisor_id && existing.supervisor_id !== userId) {
+    await notify(
+      existing.supervisor_id,
+      'Task completed',
+      `"${data.task_title}" was marked completed.`,
+    );
+  }
+
+  const [enriched] = await enrichTasks([data]);
+  res.json(enriched);
 });
 
-// POST /api/tasks/:id/employees - Add employee
-router.post('/:id/employees', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const body = addEmployeeSchema.parse(req.body);
+// POST /api/tasks/:id/complete — complete + optional activity log
+router.post('/:id/complete', async (req, res) => {
+  const userId = req.user?.id;
+  const role = req.user?.role;
 
-    const { data, error } = await supabase
-      .from('task_employees')
+  const parsed = completeSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+  }
+
+  const { data: existing } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!existing) return res.status(404).json({ error: 'Task not found' });
+  if (!canComplete(existing, userId, role)) {
+    return res.status(403).json({ error: 'Only assignee, supervisor, or manager can complete this task' });
+  }
+
+  let activityId: string | null = existing.converted_to_activity_id || null;
+
+  if (parsed.data.log_activity && existing.entity_type && existing.entity_id) {
+    const activityType = parsed.data.activity_type || 'note';
+    const { data: activity, error: actErr } = await supabase
+      .from('activities')
       .insert({
-        task_id: id,
-        ...body,
+        type: activityType,
+        entity_type: existing.entity_type,
+        entity_id: existing.entity_id,
+        subject: parsed.data.activity_subject?.trim() || existing.task_title,
+        notes: parsed.data.activity_notes?.trim() || existing.notes || null,
+        activity_date: new Date().toISOString(),
+        created_by: userId,
       })
-      .select()
+      .select('id')
       .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    res.status(201).json(data);
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: error.issues });
-    }
-    res.status(500).json({ error: 'Internal server error' });
+    if (!actErr && activity) activityId = activity.id;
   }
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .update({
+      status: 'completed',
+      completed_at: new Date().toISOString(),
+      converted_to_activity_id: activityId,
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error || !data) return res.status(500).json({ error: error?.message || 'Complete failed' });
+
+  if (existing.supervisor_id && existing.supervisor_id !== userId) {
+    await notify(existing.supervisor_id, 'Task completed', `"${data.task_title}" was marked completed.`);
+  }
+
+  const [enriched] = await enrichTasks([data]);
+  res.json(enriched);
 });
 
-// DELETE /api/tasks/:id/employees/:uid - Remove employee
-router.delete('/:id/employees/:uid', async (req, res) => {
-  try {
-    const { id, uid } = req.params;
+// DELETE soft
+router.delete('/:id', async (req, res) => {
+  const userId = req.user?.id;
+  const role = req.user?.role;
 
-    const { error } = await supabase
-      .from('task_employees')
-      .delete()
-      .eq('task_id', id)
-      .eq('user_id', uid);
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    res.json({ message: 'Employee removed successfully' });
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+  const { data: existing } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!existing) return res.status(404).json({ error: 'Task not found' });
+  if (!canDelete(existing, userId, role)) {
+    return res.status(403).json({ error: 'Only creator, supervisor, or manager can delete' });
   }
-});
 
-// POST /api/tasks/:id/attachments - Upload attachment
-router.post('/:id/attachments', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const body = z.object({
-      file_name: z.string(),
-      file_type: z.string(),
-      file_url: z.string(),
-      file_size: z.number(),
-      uploaded_by: z.string().uuid(),
-    }).parse(req.body);
-
-    const { data, error } = await supabase
-      .from('task_attachments')
-      .insert({
-        task_id: id,
-        ...body,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    res.status(201).json(data);
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// DELETE /api/tasks/:id/attachments/:aid - Delete attachment
-router.delete('/:id/attachments/:aid', async (req, res) => {
-  try {
-    const { id, aid } = req.params;
-
-    const { error } = await supabase
-      .from('task_attachments')
-      .delete()
-      .eq('id', aid)
-      .eq('task_id', id);
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    res.json({ message: 'Attachment deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// GET /api/tasks/:id/emails - Get linked emails
-router.get('/:id/emails', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from('task_emails')
-      .select('*')
-      .eq('task_id', id)
-      .order('received_at', { ascending: false });
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    res.json(data || []);
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// POST /api/tasks/:id/emails/:eid/read - Mark email as read
-router.post('/:id/emails/:eid/read', async (req, res) => {
-  try {
-    const { id, eid } = req.params;
-
-    const { data, error } = await supabase
-      .from('task_emails')
-      .update({ is_read: true })
-      .eq('id', eid)
-      .eq('task_id', id)
-      .select()
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: 'Email not found' });
-    }
-
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  const { error } = await supabase
+    .from('tasks')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 export function registerTaskRoutes(api: express.Router) {
   api.use('/tasks', router);
+}
+
+/** Daily overdue notifications — call from cron */
+export async function notifyOverdueTasks() {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data } = await supabase
+    .from('tasks')
+    .select('id, task_title, assigned_person_id, supervisor_id, due_date')
+    .is('deleted_at', null)
+    .lt('due_date', today)
+    .not('status', 'in', '("completed","cancelled")');
+
+  for (const t of data || []) {
+    const msg = `"${t.task_title}" is overdue (due ${t.due_date}).`;
+    await notify(t.assigned_person_id, 'Task overdue', msg);
+    if (t.supervisor_id && t.supervisor_id !== t.assigned_person_id) {
+      await notify(t.supervisor_id, 'Task overdue', msg);
+    }
+  }
+  return (data || []).length;
 }
