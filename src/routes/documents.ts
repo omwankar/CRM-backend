@@ -52,7 +52,9 @@ router.get('/:id', async (req, res) => {
 
 router.post('/', async (req, res) => {
   const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Please check the document details and try again.', issues: parsed.error.issues });
+  }
 
   const payload = parsed.data;
   const normalized = {
@@ -63,10 +65,17 @@ router.post('/', async (req, res) => {
     file_name: payload.file_name ?? payload.document_name ?? null,
     module: payload.module ?? payload.related_table ?? null,
     record_id: payload.record_id ?? payload.related_id ?? null,
+    uploaded_by: payload.uploaded_by ?? req.user?.id ?? null,
   };
 
   const { data, error } = await supabase.from('documents').insert(normalized).select('*').single();
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) {
+    const m = String(error.message || '').toLowerCase();
+    const friendly = m.includes('row-level security')
+      ? 'You do not have permission to upload documents.'
+      : 'Could not save the document. Please try again.';
+    return res.status(500).json({ error: friendly });
+  }
   res.status(201).json(data);
 });
 
