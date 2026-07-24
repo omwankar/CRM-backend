@@ -30,6 +30,62 @@ const schema = z.object({
 
 const updateSchema = schema.partial();
 
+function friendlyPartnershipError(message: string): string {
+  const m = String(message || '').toLowerCase();
+  if (m.includes('schema cache') || m.includes('could not find the')) {
+    return 'Could not save the partner. Please try again.';
+  }
+  if (m.includes('row-level security') || m.includes('permission')) {
+    return 'You do not have permission to manage partners.';
+  }
+  if (m.includes('duplicate') || m.includes('unique')) {
+    return 'A partner with these details already exists.';
+  }
+  if (m.includes('foreign key') || m.includes('violates')) {
+    return 'Could not save because related data is missing or invalid.';
+  }
+  return 'Could not save the partner. Please try again.';
+}
+
+/** Strip columns missing from DB schema and retry (older prod DBs). */
+async function insertWithSchemaFallback(payload: Record<string, unknown>) {
+  let attempt: Record<string, unknown> = { ...payload };
+  for (let i = 0; i < 6; i++) {
+    const { data, error } = await supabase.from('partnerships').insert(attempt).select().single();
+    if (!error) return { data, error: null as null };
+    const match = String(error.message || '').match(/Could not find the '([^']+)' column/i);
+    if (match?.[1] && match[1] in attempt) {
+      const { [match[1]]: _removed, ...rest } = attempt;
+      attempt = rest;
+      continue;
+    }
+    return { data: null, error };
+  }
+  return { data: null, error: { message: 'Could not save the partner. Please try again.' } };
+}
+
+async function updateWithSchemaFallback(id: string, payload: Record<string, unknown>) {
+  let attempt: Record<string, unknown> = { ...payload };
+  for (let i = 0; i < 6; i++) {
+    const { data, error } = await supabase
+      .from('partnerships')
+      .update(attempt)
+      .eq('id', id)
+      .is('deleted_at', null)
+      .select()
+      .single();
+    if (!error) return { data, error: null as null };
+    const match = String(error.message || '').match(/Could not find the '([^']+)' column/i);
+    if (match?.[1] && match[1] in attempt) {
+      const { [match[1]]: _removed, ...rest } = attempt;
+      attempt = rest;
+      continue;
+    }
+    return { data: null, error };
+  }
+  return { data: null, error: { message: 'Could not save the partner. Please try again.' } };
+}
+
 function normalizeTypes(body: {
   partner_type?: string | null;
   partnership_type?: string | null;
@@ -85,7 +141,7 @@ router.get('/', async (req, res) => {
   query = query.range((p - 1) * l, p * l - 1).order('created_at', { ascending: false });
 
   const { data, count, error } = await query;
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) return res.status(500).json({ error: friendlyPartnershipError(error.message) });
   res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
 });
 
@@ -171,7 +227,7 @@ router.get('/:id', async (req, res) => {
 router.post('/', async (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+    return res.status(400).json({ error: 'Please check the partner details and try again.', issues: parsed.error.issues });
   }
 
   const types = normalizeTypes(parsed.data);
@@ -180,8 +236,10 @@ router.post('/', async (req, res) => {
     ...types,
   };
 
-  const { data, error } = await supabase.from('partnerships').insert(payload).select().single();
-  if (error) return res.status(500).json({ error: error.message });
+  const { data, error } = await insertWithSchemaFallback(payload as Record<string, unknown>);
+  if (error || !data) {
+    return res.status(500).json({ error: friendlyPartnershipError(error?.message || '') });
+  }
 
   await ensurePartnerCompanyType(data.company_id);
   res.status(201).json(data);
@@ -190,7 +248,7 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
+    return res.status(400).json({ error: 'Please check the partner details and try again.', issues: parsed.error.issues });
   }
 
   const types =
@@ -198,15 +256,12 @@ router.put('/:id', async (req, res) => {
       ? normalizeTypes(parsed.data)
       : {};
 
-  const { data, error } = await supabase
-    .from('partnerships')
-    .update({ ...parsed.data, ...types })
-    .eq('id', req.params.id)
-    .is('deleted_at', null)
-    .select()
-    .single();
+  const { data, error } = await updateWithSchemaFallback(req.params.id, {
+    ...parsed.data,
+    ...types,
+  } as Record<string, unknown>);
 
-  if (error || !data) return res.status(404).json({ error: 'Not found' });
+  if (error || !data) return res.status(404).json({ error: 'Partner not found' });
 
   await ensurePartnerCompanyType(data.company_id);
   res.json(data);
