@@ -36,6 +36,105 @@ router.get('/', async (req, res) => {
   res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
 });
 
+type ExpiryAlert = {
+  id: string;
+  type: 'certification' | 'membership' | 'insurance';
+  name: string;
+  expiry_date: string;
+  days_until_expiry: number;
+  status: 'expired' | 'expiring_soon';
+  href: string;
+};
+
+function daysUntil(dateStr: string, today: Date): number | null {
+  if (!dateStr) return null;
+  const expiry = new Date(dateStr);
+  if (Number.isNaN(expiry.getTime())) return null;
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const end = new Date(expiry.getFullYear(), expiry.getMonth(), expiry.getDate());
+  return Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+/** Computed expiry alerts from certifications / memberships / insurance (not the alerts table). */
+router.get('/expiring', async (req, res) => {
+  const certDays = Math.max(1, Number(req.query.cert_days) || 30);
+  const memDays = Math.max(1, Number(req.query.membership_days) || 30);
+  const insDays = Math.max(1, Number(req.query.insurance_days) || 30);
+  const today = new Date();
+  const alerts: ExpiryAlert[] = [];
+
+  const [{ data: certs }, { data: memberships }, { data: insurances }] = await Promise.all([
+    supabase
+      .from('certifications')
+      .select('id, certification_name, expiry_date')
+      .is('deleted_at', null),
+    supabase
+      .from('memberships')
+      .select('id, organization_name, renewal_date')
+      .is('deleted_at', null),
+    supabase
+      .from('insurance')
+      .select('id, policy_name, provider, provider_name, insurance_type, policy_type, end_date, expiry_date')
+      .is('deleted_at', null),
+  ]);
+
+  for (const cert of certs || []) {
+    const days = daysUntil(cert.expiry_date, today);
+    if (days == null || days > certDays) continue;
+    alerts.push({
+      id: cert.id,
+      type: 'certification',
+      name: cert.certification_name || 'Certification',
+      expiry_date: cert.expiry_date,
+      days_until_expiry: days,
+      status: days < 0 ? 'expired' : 'expiring_soon',
+      href: `/dashboard/certifications/${cert.id}`,
+    });
+  }
+
+  for (const mem of memberships || []) {
+    const days = daysUntil(mem.renewal_date, today);
+    if (days == null || days > memDays) continue;
+    alerts.push({
+      id: mem.id,
+      type: 'membership',
+      name: mem.organization_name || 'Membership',
+      expiry_date: mem.renewal_date,
+      days_until_expiry: days,
+      status: days < 0 ? 'expired' : 'expiring_soon',
+      href: `/dashboard/memberships/${mem.id}`,
+    });
+  }
+
+  for (const ins of insurances || []) {
+    const dateStr = ins.expiry_date || ins.end_date;
+    const days = daysUntil(dateStr, today);
+    if (days == null || days > insDays) continue;
+    const label =
+      ins.policy_name ||
+      [ins.provider || ins.provider_name, ins.insurance_type || ins.policy_type]
+        .filter(Boolean)
+        .join(' · ') ||
+      'Insurance policy';
+    alerts.push({
+      id: ins.id,
+      type: 'insurance',
+      name: label,
+      expiry_date: dateStr,
+      days_until_expiry: days,
+      status: days < 0 ? 'expired' : 'expiring_soon',
+      href: `/dashboard/insurance/${ins.id}`,
+    });
+  }
+
+  alerts.sort((a, b) => a.days_until_expiry - b.days_until_expiry);
+  res.json({
+    data: alerts,
+    total: alerts.length,
+    thresholds: { certification: certDays, membership: memDays, insurance: insDays },
+  });
+});
+
 router.get('/:id', async (req, res) => {
   const { data, error } = await supabase.from('alerts').select('*').eq('id', req.params.id).maybeSingle();
   if (error || !data) return res.status(404).json({ error: 'Not found' });
