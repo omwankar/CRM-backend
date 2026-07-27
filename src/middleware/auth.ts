@@ -56,10 +56,14 @@ export const authMiddleware: RequestHandler = async (req, res, next) => {
       return;
     }
 
+    const rawRole = userData.role || 'user';
+    // Legacy rows may still use `admin`; treat as manager for write guards.
+    const role = rawRole === 'admin' ? 'manager' : rawRole;
+
     req.user = {
       id: user.id,
       email: userData.email || user.email || '',
-      role: userData.role || 'user',
+      role,
       full_name: userData.full_name || null,
     };
 

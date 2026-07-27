@@ -34,14 +34,15 @@ function db(): SupabaseClient {
  */
 export function requireRole(...allowed: Role[]): RequestHandler {
   return (req, res, next) => {
-    const role = req.user?.role as Role | undefined;
+    const rawRole = req.user?.role;
+    const role = (rawRole === 'admin' ? 'manager' : rawRole) as Role | undefined;
     if (!role) {
       res.status(401).json({ error: "unauthorized" });
       return;
     }
     if (!allowed.includes(role)) {
       res.status(403).json({
-        error: "forbidden",
+        error: "You do not have permission to do that.",
         message: `This action requires one of: ${allowed.join(", ")}`,
       });
       return;

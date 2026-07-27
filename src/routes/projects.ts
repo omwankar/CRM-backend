@@ -15,17 +15,54 @@ router.use(authMiddleware);
 // Plain `user` role can read but not mutate company-wide data.
 router.use(sharedWriteGuard);
 
+const emptyToNull = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? null : v);
+const emptyToUndefined = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? undefined : v);
+
+function friendlyProjectError(message: string): string {
+  const m = String(message || '').toLowerCase();
+  if (m.includes('schema cache') || m.includes("could not find the '")) {
+    return 'Could not save the project. Please try again.';
+  }
+  if (m.includes('duplicate') || m.includes('unique')) {
+    return 'This team member is already on the project.';
+  }
+  if (m.includes('invalid') && m.includes('email')) {
+    return 'Please enter a valid email address.';
+  }
+  if (m.includes('forbidden') || m.includes('permission')) {
+    return 'You do not have permission to create projects.';
+  }
+  return 'Could not save the project. Please try again.';
+}
+
+/** Retry without columns missing from older production schemas. */
+async function insertProjectWithFallback(payload: Record<string, unknown>) {
+  let attempt: Record<string, unknown> = { ...payload };
+  for (let i = 0; i < 8; i++) {
+    const { data, error } = await supabase.from('projects').insert(attempt).select().single();
+    if (!error) return { data, error: null as null };
+    const match = String(error.message || '').match(/Could not find the '([^']+)' column/i);
+    if (match?.[1] && match[1] in attempt) {
+      const { [match[1]]: _removed, ...rest } = attempt;
+      attempt = rest;
+      continue;
+    }
+    return { data: null, error };
+  }
+  return { data: null, error: { message: 'Could not save the project. Please try again.' } };
+}
+
 // Validation schemas
 const createProjectSchema = z.object({
-  project_name: z.string().min(1, 'Project name is required'),
-  assigned_person_id: z.string().uuid().nullable().optional(),
-  supervisor_id: z.string().uuid().nullable().optional(),
-  contact_email: z.string().email().optional().or(z.literal('')),
-  contact_phone: z.string().optional(),
-  start_date: z.string().optional(),
-  estimated_end_date: z.string().optional(),
-  requirements_notes: z.string().optional(),
-  linked_email: z.string().email().optional().or(z.literal('')),
+  project_name: z.string().trim().min(1, 'Project name is required'),
+  assigned_person_id: z.preprocess(emptyToNull, z.string().uuid().nullable().optional()),
+  supervisor_id: z.preprocess(emptyToNull, z.string().uuid().nullable().optional()),
+  contact_email: z.preprocess(emptyToUndefined, z.string().email('Invalid contact email').optional()),
+  contact_phone: z.preprocess(emptyToNull, z.string().nullable().optional()),
+  start_date: z.preprocess(emptyToNull, z.string().nullable().optional()),
+  estimated_end_date: z.preprocess(emptyToNull, z.string().nullable().optional()),
+  requirements_notes: z.preprocess(emptyToNull, z.string().nullable().optional()),
+  linked_email: z.preprocess(emptyToUndefined, z.string().email('Invalid linked email').optional()),
   status: z.enum(['Active', 'Planned', 'On Hold', 'Closed', 'Cancelled']).default('Planned'),
   created_by: z.string().uuid(),
 });
@@ -288,42 +325,42 @@ router.post('/', async (req, res) => {
   try {
     const body = createProjectSchema.parse(req.body);
 
-    const { data, error } = await supabase
-      .from('projects')
-      .insert(body)
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
+    const { data, error } = await insertProjectWithFallback(body as Record<string, unknown>);
+    if (error || !data) {
+      return res.status(400).json({ error: friendlyProjectError(error?.message || '') });
     }
 
-    // Add creator as admin employee
+    // Add creator as admin employee (ignore duplicate if already present)
     await supabase
       .from('project_employees')
-      .insert({
-        project_id: data.id,
-        user_id: body.created_by,
-        role: 'admin',
-      });
+      .upsert(
+        {
+          project_id: data.id,
+          user_id: body.created_by,
+          role: 'admin',
+        },
+        { onConflict: 'project_id,user_id', ignoreDuplicates: true }
+      );
 
     // Add initial status history
-    await supabase
-      .from('project_status_history')
-      .insert({
-        project_id: data.id,
-        old_status: null,
-        new_status: body.status,
-        reason: 'Project created',
-        changed_by: body.created_by,
-      });
+    await supabase.from('project_status_history').insert({
+      project_id: data.id,
+      old_status: null,
+      new_status: body.status,
+      reason: 'Project created',
+      changed_by: body.created_by,
+    });
 
     res.status(201).json(data);
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: error.issues });
+      const first = error.issues[0];
+      const field = first?.path?.join('.') || 'field';
+      const msg =
+        field.includes('email') ? 'Please enter a valid email address.' : 'Please check the project details and try again.';
+      return res.status(400).json({ error: msg, issues: error.issues });
     }
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Could not save the project. Please try again.' });
   }
 });
 
@@ -489,15 +526,18 @@ router.post('/:id/employees', async (req, res) => {
 
     const { data, error } = await supabase
       .from('project_employees')
-      .insert({
-        project_id: id,
-        ...body,
-      })
+      .upsert(
+        {
+          project_id: id,
+          ...body,
+        },
+        { onConflict: 'project_id,user_id' }
+      )
       .select()
       .single();
 
     if (error) {
-      return res.status(400).json({ error: error.message });
+      return res.status(400).json({ error: friendlyProjectError(error.message) });
     }
 
     res.status(201).json(data);
