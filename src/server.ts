@@ -42,6 +42,7 @@ import { registerEmailRoutes, registerEmailSyncInternalRoute } from "./routes/em
 import { startEmailSyncCron } from "./jobs/emailSyncCron.js";
 import { startTaskOverdueCron } from "./jobs/taskOverdueCron.js";
 import { startAnnouncementExpiryCron } from "./jobs/announcementExpiryCron.js";
+import { startClockAutoClockOutCron } from "./jobs/clockAutoClockOutCron.js";
 import { isGraphConfigured, isGraphSendConfigured } from "./services/graphClient.js";
 
 const env = loadEnv();
@@ -136,5 +137,6 @@ app.listen(env.PORT, () => {
   startEmailSyncCron();
   startTaskOverdueCron();
   startAnnouncementExpiryCron();
+  startClockAutoClockOutCron();
 });
 
