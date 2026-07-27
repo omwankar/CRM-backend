@@ -43,6 +43,7 @@ import { startEmailSyncCron } from "./jobs/emailSyncCron.js";
 import { startTaskOverdueCron } from "./jobs/taskOverdueCron.js";
 import { startAnnouncementExpiryCron } from "./jobs/announcementExpiryCron.js";
 import { startClockAutoClockOutCron } from "./jobs/clockAutoClockOutCron.js";
+import { startClockOpenSessionWarningCron } from "./jobs/clockOpenSessionWarningCron.js";
 import { isGraphConfigured, isGraphSendConfigured } from "./services/graphClient.js";
 
 const env = loadEnv();
@@ -138,5 +139,6 @@ app.listen(env.PORT, () => {
   startTaskOverdueCron();
   startAnnouncementExpiryCron();
   startClockAutoClockOutCron();
+  startClockOpenSessionWarningCron();
 });
 
