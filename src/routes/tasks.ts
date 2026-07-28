@@ -546,8 +546,13 @@ export async function notifyOverdueTasks() {
     .lt('due_date', today)
     .not('status', 'in', '("completed","cancelled")');
 
+  const formatDue = (raw: string | null | undefined) => {
+    const m = String(raw || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return m ? `${m[3]}/${m[2]}/${m[1]}` : raw || '';
+  };
+
   for (const t of data || []) {
-    const msg = `"${t.task_title}" is overdue (due ${t.due_date}).`;
+    const msg = `"${t.task_title}" is overdue (due ${formatDue(t.due_date)}).`;
     await notify(t.assigned_person_id, 'Task overdue', msg);
     if (t.supervisor_id && t.supervisor_id !== t.assigned_person_id) {
       await notify(t.supervisor_id, 'Task overdue', msg);
