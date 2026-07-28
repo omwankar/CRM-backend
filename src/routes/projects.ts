@@ -52,6 +52,28 @@ async function insertProjectWithFallback(payload: Record<string, unknown>) {
   return { data: null, error: { message: 'Could not save the project. Please try again.' } };
 }
 
+async function updateProjectWithFallback(id: string, payload: Record<string, unknown>) {
+  let attempt: Record<string, unknown> = { ...payload };
+  for (let i = 0; i < 8; i++) {
+    const { data, error } = await supabase
+      .from('projects')
+      .update(attempt)
+      .eq('id', id)
+      .is('deleted_at', null)
+      .select()
+      .single();
+    if (!error) return { data, error: null as null };
+    const match = String(error.message || '').match(/Could not find the '([^']+)' column/i);
+    if (match?.[1] && match[1] in attempt) {
+      const { [match[1]]: _removed, ...rest } = attempt;
+      attempt = rest;
+      continue;
+    }
+    return { data: null, error };
+  }
+  return { data: null, error: { message: 'Could not save the project. Please try again.' } };
+}
+
 // Validation schemas
 const createProjectSchema = z.object({
   project_name: z.string().trim().min(1, 'Project name is required'),
@@ -68,15 +90,15 @@ const createProjectSchema = z.object({
 });
 
 const updateProjectSchema = z.object({
-  project_name: z.string().min(1).optional(),
-  assigned_person_id: z.string().uuid().nullable().optional(),
-  supervisor_id: z.string().uuid().nullable().optional(),
-  contact_email: z.string().email().optional().or(z.literal('')),
-  contact_phone: z.string().optional(),
-  start_date: z.string().optional(),
-  estimated_end_date: z.string().optional(),
-  requirements_notes: z.string().optional(),
-  linked_email: z.string().email().optional().or(z.literal('')),
+  project_name: z.string().trim().min(1).optional(),
+  assigned_person_id: z.preprocess(emptyToNull, z.string().uuid().nullable().optional()),
+  supervisor_id: z.preprocess(emptyToNull, z.string().uuid().nullable().optional()),
+  contact_email: z.preprocess(emptyToUndefined, z.string().email('Invalid contact email').optional()),
+  contact_phone: z.preprocess(emptyToNull, z.string().nullable().optional()),
+  start_date: z.preprocess(emptyToNull, z.string().nullable().optional()),
+  estimated_end_date: z.preprocess(emptyToNull, z.string().nullable().optional()),
+  requirements_notes: z.preprocess(emptyToNull, z.string().nullable().optional()),
+  linked_email: z.preprocess(emptyToUndefined, z.string().email('Invalid linked email').optional()),
   status: z.enum(['Active', 'Planned', 'On Hold', 'Closed', 'Cancelled']).optional(),
 });
 
@@ -370,24 +392,23 @@ router.put('/:id', async (req, res) => {
     const { id } = req.params;
     const body = updateProjectSchema.parse(req.body);
 
-    const { data, error } = await supabase
-      .from('projects')
-      .update(body)
-      .eq('id', id)
-      .is('deleted_at', null)
-      .select()
-      .single();
-
+    const { data, error } = await updateProjectWithFallback(id, body as Record<string, unknown>);
     if (error || !data) {
-      return res.status(404).json({ error: 'Project not found' });
+      return res.status(400).json({ error: friendlyProjectError(error?.message || 'Project not found') });
     }
 
     res.json(data);
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: error.issues });
+      const first = error.issues[0];
+      const field = first?.path?.join('.') || 'field';
+      const msg =
+        field.includes('email')
+          ? 'Please enter a valid email address.'
+          : 'Please check the project details and try again.';
+      return res.status(400).json({ error: msg, issues: error.issues });
     }
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Could not save the project. Please try again.' });
   }
 });
 
