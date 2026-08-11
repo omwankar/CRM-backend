@@ -4,7 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../middleware/auth.js";
 import { requireRole, requireSuperAdmin } from "../middleware/requireRole.js";
 import { isGraphConfigured, getSyncAllowlist } from "../services/graphClient.js";
-import { discoverTenantMailboxes, fetchMessageBody, runEmailSync } from "../services/graphMailSync.js";
+import { discoverTenantMailboxes, fetchMessageBody, runEmailSync, backfillEmailSignatures, guessCompanyFromSender } from "../services/graphMailSync.js";
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -247,6 +247,29 @@ router.post("/sync", requireSuperAdmin, async (_req, res) => {
   }
 });
 
+// POST /api/emails/backfill-signatures
+// Re-fetch full bodies from Graph and parse phone/company into sig_* columns
+router.post("/backfill-signatures", requireSuperAdmin, async (req, res) => {
+  if (!isGraphConfigured()) {
+    return res.status(503).json({ error: "Microsoft Graph is not configured on the server" });
+  }
+  if (syncInProgress) {
+    return res.status(409).json({ error: "Sync already in progress — try again shortly" });
+  }
+
+  syncInProgress = true;
+  try {
+    const limit = Math.min(1000, Math.max(1, Number(req.body?.limit) || 300));
+    const result = await backfillEmailSignatures({ limit });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Backfill failed";
+    res.status(500).json({ error: message });
+  } finally {
+    syncInProgress = false;
+  }
+});
+
 // POST /api/emails/purge — delete all synced emails and mailbox cache (super_admin)
 router.post("/purge", requireSuperAdmin, async (_req, res) => {
   const zeroUuid = "00000000-0000-0000-0000-000000000000";
@@ -454,7 +477,9 @@ router.get("/contacts-extract", requireRole("manager", "super_admin"), async (re
     const key = email.toLowerCase();
     const name = row.sender_name ? String(row.sender_name) : null;
     const phone = row.sig_phone ? String(row.sig_phone) : null;
-    const company = row.sig_company ? String(row.sig_company) : null;
+    const company =
+      (row.sig_company ? String(row.sig_company) : null) ||
+      guessCompanyFromSender(name, email);
     const existing = map.get(key);
     if (!existing) {
       map.set(key, { name, email, phone, company, count: 1 });

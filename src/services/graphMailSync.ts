@@ -390,20 +390,153 @@ function extractSignatureBlock(bodyText: string): string {
   return lines.slice(Math.max(0, lines.length - 20)).join("\n").slice(0, 800);
 }
 
-function parseSignature(msg: GraphMessage): { sig_phone: string | null; sig_company: string | null } {
-  const bodyContent = msg.body?.content || "";
-  const bodyText =
-    msg.body?.contentType?.toLowerCase() === "html"
-      ? htmlToText(bodyContent)
-      : bodyContent || msg.bodyPreview || "";
+function parseSignatureFromContent(input: {
+  body_html?: string | null;
+  body_text?: string | null;
+  body_preview?: string | null;
+}): { sig_phone: string | null; sig_company: string | null } {
+  const bodyText = input.body_html
+    ? htmlToText(input.body_html)
+    : input.body_text || input.body_preview || "";
 
   if (!bodyText) return { sig_phone: null, sig_company: null };
 
   const sigBlock = extractSignatureBlock(bodyText);
-  return {
-    sig_phone: extractPhone(sigBlock),
-    sig_company: extractCompany(sigBlock),
-  };
+  // Also scan full text for phone — signatures sometimes sit above the delimiter match
+  const phone = extractPhone(sigBlock) || extractPhone(bodyText);
+  const company = extractCompany(sigBlock) || extractCompany(bodyText);
+  return { sig_phone: phone, sig_company: company };
+}
+
+function parseSignature(msg: GraphMessage): { sig_phone: string | null; sig_company: string | null } {
+  const bodyContent = msg.body?.content || "";
+  const isHtml = msg.body?.contentType?.toLowerCase() === "html";
+  return parseSignatureFromContent({
+    body_html: isHtml ? bodyContent : null,
+    body_text: isHtml ? null : bodyContent,
+    body_preview: msg.bodyPreview || null,
+  });
+}
+
+/** Guess company from sender display name or email domain when signature has none */
+export function guessCompanyFromSender(senderName: string | null, senderEmail: string | null): string | null {
+  const name = (senderName || "").trim();
+  if (
+    name &&
+    /\b(ltd|llc|inc|corp|group|solutions|shipping|international|trading|global|industries|services|consultancy|associates|partners|plc|gmbh|bv|pvt|co\.|company)\b/i.test(
+      name,
+    )
+  ) {
+    return name;
+  }
+
+  const email = (senderEmail || "").toLowerCase();
+  const domain = email.split("@")[1] || "";
+  if (!domain) return null;
+  // Skip free / generic mail providers
+  if (
+    /^(gmail|googlemail|yahoo|hotmail|outlook|live|icloud|aol|mail|protonmail|qq|163|126|vip\.126|me)\./i.test(
+      domain,
+    ) ||
+    /^(gmail|yahoo|hotmail|outlook|live|icloud|aol|protonmail|qq|163|126)\.com$/i.test(domain)
+  ) {
+    return null;
+  }
+  // e.g. sales@aasaj-shipping.com → aasaj-shipping
+  const base = domain.split(".")[0];
+  if (!base || base.length < 2) return null;
+  return base.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * Re-fetch full bodies from Microsoft Graph for emails missing signature data,
+ * then parse phone/company into sig_phone / sig_company.
+ */
+export async function backfillEmailSignatures(options: {
+  limit?: number;
+} = {}): Promise<{ processed: number; updated: number; phones: number; companies: number; errors: number }> {
+  const limit = Math.min(Math.max(1, options.limit || 200), 1000);
+
+  const { data: rows, error } = await supabase()
+    .from("company_emails")
+    .select(
+      "id, graph_message_id, mailbox_id, sender_name, sender_email, body_html, body_text, body_preview, sig_phone, sig_company",
+    )
+    .eq("direction", "inbound")
+    .not("sender_email", "is", null)
+    .or("sig_phone.is.null,sig_company.is.null,body_html.is.null,body_text.is.null")
+    .order("received_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw new Error(error.message);
+
+  // Resolve mailbox → graph_user_id
+  const mailboxIds = [...new Set((rows || []).map((r) => r.mailbox_id).filter(Boolean))];
+  const { data: mailboxes } = await supabase()
+    .from("mailboxes")
+    .select("id, graph_user_id")
+    .in("id", mailboxIds);
+  const graphByMailbox = new Map((mailboxes || []).map((m) => [m.id as string, m.graph_user_id as string]));
+
+  let processed = 0;
+  let updated = 0;
+  let phones = 0;
+  let companies = 0;
+  let errors = 0;
+
+  for (const row of rows || []) {
+    processed += 1;
+    try {
+      let bodyHtml = row.body_html as string | null;
+      let bodyText = row.body_text as string | null;
+
+      // Fetch full body from Graph when missing
+      if (!bodyHtml && !bodyText && row.graph_message_id && row.mailbox_id) {
+        const graphUserId = graphByMailbox.get(row.mailbox_id as string);
+        if (graphUserId) {
+          const fetched = await fetchMessageBody(graphUserId, row.graph_message_id as string);
+          bodyHtml = fetched.body_html;
+          bodyText = fetched.body_text;
+          // small pause to avoid Graph throttling
+          await new Promise((r) => setTimeout(r, 80));
+        }
+      }
+
+      const parsed = parseSignatureFromContent({
+        body_html: bodyHtml,
+        body_text: bodyText,
+        body_preview: row.body_preview as string | null,
+      });
+
+      const sig_phone = parsed.sig_phone || (row.sig_phone as string | null) || null;
+      const sig_company =
+        parsed.sig_company ||
+        (row.sig_company as string | null) ||
+        guessCompanyFromSender(row.sender_name as string | null, row.sender_email as string | null);
+
+      const patch: Record<string, unknown> = {};
+      if (bodyHtml && !row.body_html) patch.body_html = bodyHtml;
+      if (bodyText && !row.body_text) patch.body_text = bodyText;
+      if (sig_phone && !row.sig_phone) patch.sig_phone = sig_phone;
+      if (sig_company && !row.sig_company) patch.sig_company = sig_company;
+
+      if (Object.keys(patch).length) {
+        const { error: upErr } = await supabase().from("company_emails").update(patch).eq("id", row.id);
+        if (upErr) {
+          errors += 1;
+        } else {
+          updated += 1;
+          if (patch.sig_phone) phones += 1;
+          if (patch.sig_company) companies += 1;
+        }
+      }
+    } catch (err) {
+      errors += 1;
+      console.warn("[email-backfill]", row.id, err instanceof Error ? err.message : err);
+    }
+  }
+
+  return { processed, updated, phones, companies, errors };
 }
 
 function mapMessage(
@@ -421,7 +554,10 @@ function mapMessage(
 
   const bodyContent = msg.body?.content || null;
   const isHtml = msg.body?.contentType?.toLowerCase() === "html";
-  const { sig_phone, sig_company } = parseSignature(msg);
+  const parsed = parseSignature(msg);
+  const senderName = msg.from?.emailAddress?.name || null;
+  const sig_phone = parsed.sig_phone;
+  const sig_company = parsed.sig_company || guessCompanyFromSender(senderName, senderEmail);
 
   return {
     graph_message_id: msg.id,
@@ -430,7 +566,7 @@ function mapMessage(
     mailbox_id: mailboxId,
     mailbox_email: mailboxEmail,
     subject: msg.subject || "(No subject)",
-    sender_name: msg.from?.emailAddress?.name || null,
+    sender_name: senderName,
     sender_email: senderEmail,
     to_emails: toEmails,
     cc_emails: ccEmails,
