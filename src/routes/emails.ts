@@ -4,7 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../middleware/auth.js";
 import { requireRole, requireSuperAdmin } from "../middleware/requireRole.js";
 import { isGraphConfigured, getSyncAllowlist } from "../services/graphClient.js";
-import { discoverTenantMailboxes, fetchMessageBody, runEmailSync, backfillEmailSignatures, guessCompanyFromSender } from "../services/graphMailSync.js";
+import { discoverTenantMailboxes, fetchMessageBody, runEmailSync, backfillEmailSignatures, startFullSignatureBackfill, isFullSignatureBackfillRunning, guessCompanyFromSender } from "../services/graphMailSync.js";
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -231,8 +231,8 @@ router.post("/sync", requireSuperAdmin, async (_req, res) => {
   if (!isGraphConfigured()) {
     return res.status(503).json({ error: "Microsoft Graph is not configured on the server" });
   }
-  if (syncInProgress) {
-    return res.status(409).json({ error: "Sync already in progress" });
+  if (syncInProgress || isFullSignatureBackfillRunning()) {
+    return res.status(409).json({ error: "Another email job is already in progress" });
   }
 
   syncInProgress = true;
@@ -248,19 +248,44 @@ router.post("/sync", requireSuperAdmin, async (_req, res) => {
 });
 
 // POST /api/emails/backfill-signatures
-// Re-fetch full bodies from Graph and parse phone/company into sig_* columns
+// Re-fetch / re-parse phone+company for emails.
+// body: { all?: true, force?: true, limit?: number }
 router.post("/backfill-signatures", requireSuperAdmin, async (req, res) => {
-  if (!isGraphConfigured()) {
-    return res.status(503).json({ error: "Microsoft Graph is not configured on the server" });
+  const all = Boolean(req.body?.all);
+  const force = Boolean(req.body?.force ?? all);
+
+  // Full DB run starts in background so Render HTTP timeout doesn't kill it
+  if (all) {
+    if (!isGraphConfigured()) {
+      return res.status(503).json({ error: "Microsoft Graph is not configured on the server" });
+    }
+    if (syncInProgress || isFullSignatureBackfillRunning()) {
+      return res.status(409).json({
+        error: isFullSignatureBackfillRunning()
+          ? "Full signature parse is already running"
+          : "Sync already in progress — try again shortly",
+      });
+    }
+    const started = startFullSignatureBackfill();
+    return res.json({
+      success: started.started,
+      background: true,
+      message: started.message,
+    });
   }
-  if (syncInProgress) {
-    return res.status(409).json({ error: "Sync already in progress — try again shortly" });
+
+  if (syncInProgress || isFullSignatureBackfillRunning()) {
+    return res.status(409).json({ error: "Another email job is already running — try again shortly" });
   }
 
   syncInProgress = true;
   try {
     const limit = Math.min(1000, Math.max(1, Number(req.body?.limit) || 300));
-    const result = await backfillEmailSignatures({ limit });
+    const result = await backfillEmailSignatures({
+      limit,
+      force,
+      fetchMissingBodies: isGraphConfigured(),
+    });
     res.json({ success: true, ...result });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Backfill failed";

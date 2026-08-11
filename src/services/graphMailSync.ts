@@ -537,95 +537,238 @@ export function guessCompanyFromSender(senderName: string | null, senderEmail: s
   return base.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+function isJunkPhone(value: string | null | undefined): boolean {
+  if (!value) return true;
+  const digits = value.replace(/\D/g, "");
+  if (digits.length < 8 || digits.length > 15) return true;
+  if (/^\d{4}-\d{2}-\d{2}/.test(value)) return true; // dates mistaken as phones
+  if (/\)\s*\(/.test(value) || /\)\)/.test(value)) return true;
+  return false;
+}
+
+function isJunkCompany(value: string | null | undefined): boolean {
+  if (!value) return true;
+  if (value.length > 60) return true;
+  if (/^(number|no\.?)\s*:/i.test(value)) return true;
+  if (/^SC\d+/i.test(value)) return true;
+  if (/company\s*number|vat\s*number|eori|shall cease/i.test(value)) return true;
+  return false;
+}
+
+export type BackfillResult = {
+  processed: number;
+  updated: number;
+  phones: number;
+  companies: number;
+  errors: number;
+  mode: "batch" | "all";
+  background?: boolean;
+};
+
 /**
- * Re-fetch full bodies from Microsoft Graph for emails missing signature data,
- * then parse phone/company into sig_phone / sig_company.
+ * Re-parse phone/company from email bodies.
+ * - force: overwrite junk / recompute even if fields already set
+ * - all: page through every inbound email (stored bodies first, then Graph fetch for missing)
+ * - fetchMissingBodies: call Microsoft Graph when body_html/body_text are empty
  */
 export async function backfillEmailSignatures(options: {
   limit?: number;
-} = {}): Promise<{ processed: number; updated: number; phones: number; companies: number; errors: number }> {
-  const limit = Math.min(Math.max(1, options.limit || 200), 1000);
-
-  const { data: rows, error } = await supabase()
-    .from("company_emails")
-    .select(
-      "id, graph_message_id, mailbox_id, sender_name, sender_email, body_html, body_text, body_preview, sig_phone, sig_company",
-    )
-    .eq("direction", "inbound")
-    .not("sender_email", "is", null)
-    .or("sig_phone.is.null,sig_company.is.null,body_html.is.null,body_text.is.null")
-    .order("received_at", { ascending: false })
-    .limit(limit);
-
-  if (error) throw new Error(error.message);
-
-  // Resolve mailbox → graph_user_id
-  const mailboxIds = [...new Set((rows || []).map((r) => r.mailbox_id).filter(Boolean))];
-  const { data: mailboxes } = await supabase()
-    .from("mailboxes")
-    .select("id, graph_user_id")
-    .in("id", mailboxIds);
-  const graphByMailbox = new Map((mailboxes || []).map((m) => [m.id as string, m.graph_user_id as string]));
+  force?: boolean;
+  all?: boolean;
+  fetchMissingBodies?: boolean;
+} = {}): Promise<BackfillResult> {
+  const all = Boolean(options.all);
+  const force = Boolean(options.force ?? all);
+  const fetchMissingBodies = options.fetchMissingBodies !== false;
+  const pageSize = all ? 500 : Math.min(Math.max(1, options.limit || 200), 1000);
 
   let processed = 0;
   let updated = 0;
   let phones = 0;
   let companies = 0;
   let errors = 0;
+  let from = 0;
 
-  for (const row of rows || []) {
-    processed += 1;
-    try {
-      let bodyHtml = row.body_html as string | null;
-      let bodyText = row.body_text as string | null;
-
-      // Fetch full body from Graph when missing
-      if (!bodyHtml && !bodyText && row.graph_message_id && row.mailbox_id) {
-        const graphUserId = graphByMailbox.get(row.mailbox_id as string);
-        if (graphUserId) {
-          const fetched = await fetchMessageBody(graphUserId, row.graph_message_id as string);
-          bodyHtml = fetched.body_html;
-          bodyText = fetched.body_text;
-          // small pause to avoid Graph throttling
-          await new Promise((r) => setTimeout(r, 80));
-        }
-      }
-
-      const parsed = parseSignatureFromContent({
-        body_html: bodyHtml,
-        body_text: bodyText,
-        body_preview: row.body_preview as string | null,
-      });
-
-      const sig_phone = parsed.sig_phone || (row.sig_phone as string | null) || null;
-      const sig_company =
-        parsed.sig_company ||
-        (row.sig_company as string | null) ||
-        guessCompanyFromSender(row.sender_name as string | null, row.sender_email as string | null);
-
-      const patch: Record<string, unknown> = {};
-      if (bodyHtml && !row.body_html) patch.body_html = bodyHtml;
-      if (bodyText && !row.body_text) patch.body_text = bodyText;
-      if (sig_phone && !row.sig_phone) patch.sig_phone = sig_phone;
-      if (sig_company && !row.sig_company) patch.sig_company = sig_company;
-
-      if (Object.keys(patch).length) {
-        const { error: upErr } = await supabase().from("company_emails").update(patch).eq("id", row.id);
-        if (upErr) {
-          errors += 1;
-        } else {
-          updated += 1;
-          if (patch.sig_phone) phones += 1;
-          if (patch.sig_company) companies += 1;
-        }
-      }
-    } catch (err) {
-      errors += 1;
-      console.warn("[email-backfill]", row.id, err instanceof Error ? err.message : err);
-    }
+  // Cache mailbox → graph user
+  const graphByMailbox = new Map<string, string>();
+  async function resolveGraphUser(mailboxId: string): Promise<string | null> {
+    if (graphByMailbox.has(mailboxId)) return graphByMailbox.get(mailboxId)!;
+    const { data } = await supabase()
+      .from("mailboxes")
+      .select("graph_user_id")
+      .eq("id", mailboxId)
+      .maybeSingle();
+    const gid = (data?.graph_user_id as string) || null;
+    if (gid) graphByMailbox.set(mailboxId, gid);
+    return gid;
   }
 
-  return { processed, updated, phones, companies, errors };
+  while (true) {
+    let query = supabase()
+      .from("company_emails")
+      .select(
+        "id, graph_message_id, mailbox_id, sender_name, sender_email, body_html, body_text, body_preview, sig_phone, sig_company",
+      )
+      .eq("direction", "inbound")
+      .not("sender_email", "is", null)
+      .order("received_at", { ascending: false })
+      .range(from, from + pageSize - 1);
+
+    if (!force && !all) {
+      query = query.or(
+        "sig_phone.is.null,sig_company.is.null,body_html.is.null,body_text.is.null",
+      );
+    }
+
+    const { data: rows, error } = await query;
+    if (error) throw new Error(error.message);
+    if (!rows?.length) break;
+
+    for (const row of rows) {
+      processed += 1;
+      try {
+        let bodyHtml = row.body_html as string | null;
+        let bodyText = row.body_text as string | null;
+
+        // Fetch full body from Graph when missing
+        if (
+          fetchMissingBodies &&
+          !bodyHtml &&
+          !bodyText &&
+          row.graph_message_id &&
+          row.mailbox_id
+        ) {
+          const graphUserId = await resolveGraphUser(row.mailbox_id as string);
+          if (graphUserId) {
+            try {
+              const fetched = await fetchMessageBody(graphUserId, row.graph_message_id as string);
+              bodyHtml = fetched.body_html;
+              bodyText = fetched.body_text;
+              await new Promise((r) => setTimeout(r, 50));
+            } catch (err) {
+              errors += 1;
+              console.warn(
+                "[email-backfill] graph fetch failed",
+                row.id,
+                err instanceof Error ? err.message : err,
+              );
+            }
+          }
+        }
+
+        const parsed = parseSignatureFromContent({
+          body_html: bodyHtml,
+          body_text: bodyText,
+          body_preview: row.body_preview as string | null,
+        });
+
+        const existingPhone = row.sig_phone as string | null;
+        const existingCompany = row.sig_company as string | null;
+
+        let sig_phone =
+          parsed.sig_phone ||
+          (!isJunkPhone(existingPhone) ? existingPhone : null) ||
+          null;
+        let sig_company =
+          parsed.sig_company ||
+          (!isJunkCompany(existingCompany) ? existingCompany : null) ||
+          guessCompanyFromSender(row.sender_name as string | null, row.sender_email as string | null);
+
+        if (force) {
+          // Prefer freshly parsed values; clear junk even if nothing better found
+          sig_phone = parsed.sig_phone || (!isJunkPhone(existingPhone) ? existingPhone : null);
+          sig_company =
+            parsed.sig_company ||
+            guessCompanyFromSender(row.sender_name as string | null, row.sender_email as string | null) ||
+            (!isJunkCompany(existingCompany) ? existingCompany : null);
+        }
+
+        const patch: Record<string, unknown> = {};
+        if (bodyHtml && bodyHtml !== row.body_html) patch.body_html = bodyHtml;
+        if (bodyText && bodyText !== row.body_text) patch.body_text = bodyText;
+
+        if (force) {
+          if (sig_phone !== existingPhone) patch.sig_phone = sig_phone;
+          if (sig_company !== existingCompany) patch.sig_company = sig_company;
+          // Always clear junk even if result is null
+          if (isJunkPhone(existingPhone) && !sig_phone) patch.sig_phone = null;
+          if (isJunkCompany(existingCompany) && !sig_company) patch.sig_company = null;
+        } else {
+          if (sig_phone && (!existingPhone || isJunkPhone(existingPhone))) patch.sig_phone = sig_phone;
+          if (sig_company && (!existingCompany || isJunkCompany(existingCompany))) {
+            patch.sig_company = sig_company;
+          }
+        }
+
+        if (Object.keys(patch).length) {
+          const { error: upErr } = await supabase()
+            .from("company_emails")
+            .update(patch)
+            .eq("id", row.id);
+          if (upErr) {
+            errors += 1;
+          } else {
+            updated += 1;
+            if (patch.sig_phone) phones += 1;
+            if (patch.sig_company) companies += 1;
+          }
+        }
+      } catch (err) {
+        errors += 1;
+        console.warn("[email-backfill]", row.id, err instanceof Error ? err.message : err);
+      }
+    }
+
+    // For limited batch mode, stop after one page
+    if (!all) break;
+
+    from += pageSize;
+    // Safety: if page returned fewer than pageSize, we're done
+    if (rows.length < pageSize) break;
+
+    console.log(
+      `[email-backfill] progress processed=${processed} updated=${updated} phones=${phones} companies=${companies}`,
+    );
+  }
+
+  return {
+    processed,
+    updated,
+    phones,
+    companies,
+    errors,
+    mode: all ? "all" : "batch",
+  };
+}
+
+let fullBackfillRunning = false;
+
+/** Start a full DB re-parse in the background (does not block HTTP). */
+export function startFullSignatureBackfill(): { started: boolean; message: string } {
+  if (fullBackfillRunning) {
+    return { started: false, message: "Full signature backfill already running" };
+  }
+  fullBackfillRunning = true;
+  setImmediate(() => {
+    backfillEmailSignatures({ all: true, force: true, fetchMissingBodies: true })
+      .then((r) => {
+        console.log("[email-backfill] FULL DONE", r);
+      })
+      .catch((err) => {
+        console.error("[email-backfill] FULL FAILED", err);
+      })
+      .finally(() => {
+        fullBackfillRunning = false;
+      });
+  });
+  return {
+    started: true,
+    message: "Full signature re-parse started in background for all inbound emails",
+  };
+}
+
+export function isFullSignatureBackfillRunning(): boolean {
+  return fullBackfillRunning;
 }
 
 function mapMessage(
