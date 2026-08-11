@@ -402,6 +402,120 @@ router.patch("/:id/link", requireRole("manager", "super_admin"), async (req, res
   res.json(data);
 });
 
+// GET /api/emails/contacts-extract
+// Returns unique senders enriched with phone/company parsed from signatures
+router.get("/contacts-extract", requireRole("manager", "super_admin"), async (req, res) => {
+  const scopedMailbox = isSuperAdmin(req) ? null : callerMailboxEmail(req);
+
+  let query = supabase
+    .from("company_emails")
+    .select("sender_name, sender_email, sig_phone, sig_company")
+    .not("sender_email", "is", null)
+    .neq("sender_email", "")
+    .eq("direction", "inbound");
+
+  if (scopedMailbox) {
+    query = query.ilike("mailbox_email", scopedMailbox);
+  }
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Deduplicate by lower-cased email, merging best available phone/company per sender
+  const map = new Map<
+    string,
+    { name: string | null; email: string; phone: string | null; company: string | null; count: number }
+  >();
+
+  for (const row of data || []) {
+    const key = (row.sender_email as string).toLowerCase();
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, {
+        name: row.sender_name || null,
+        email: row.sender_email as string,
+        phone: row.sig_phone || null,
+        company: row.sig_company || null,
+        count: 1,
+      });
+    } else {
+      existing.count += 1;
+      if (!existing.phone && row.sig_phone) existing.phone = row.sig_phone;
+      if (!existing.company && row.sig_company) existing.company = row.sig_company;
+      if (!existing.name && row.sender_name) existing.name = row.sender_name;
+    }
+  }
+
+  // Check which emails already exist as contacts
+  const allEmails = [...map.keys()];
+  const existingContacts = new Set<string>();
+  if (allEmails.length) {
+    const { data: contacts } = await supabase
+      .from("contacts")
+      .select("email")
+      .in("email", allEmails);
+    for (const c of contacts || []) {
+      if (c.email) existingContacts.add((c.email as string).toLowerCase());
+    }
+  }
+
+  const results = [...map.values()]
+    .map((r) => ({ ...r, already_contact: existingContacts.has(r.email.toLowerCase()) }))
+    .sort((a, b) => b.count - a.count);
+
+  res.json({ data: results, total: results.length });
+});
+
+// POST /api/emails/contacts-extract/import
+// Bulk-import selected email senders as contacts
+router.post(
+  "/contacts-extract/import",
+  requireRole("manager", "super_admin"),
+  async (req, res) => {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const items = req.body?.contacts;
+    if (!Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: "contacts array is required" });
+    }
+
+    let imported = 0;
+    let skipped = 0;
+    const errors: string[] = [];
+
+    for (const item of items) {
+      const email = String(item.email || "").trim().toLowerCase();
+      if (!email) { skipped++; continue; }
+
+      // Skip if already a contact
+      const { data: existing } = await supabase
+        .from("contacts")
+        .select("id")
+        .ilike("email", email)
+        .maybeSingle();
+
+      if (existing) { skipped++; continue; }
+
+      const { error } = await supabase.from("contacts").insert({
+        full_name: String(item.name || email).trim(),
+        email,
+        phone: item.phone ? String(item.phone).trim() : null,
+        company: item.company ? String(item.company).trim() : null,
+        created_by: userId,
+      });
+
+      if (error) {
+        errors.push(`${email}: ${error.message}`);
+      } else {
+        imported++;
+      }
+    }
+
+    res.json({ imported, skipped, errors });
+  },
+);
+
 export function registerEmailRoutes(api: express.Router) {
   api.use("/emails", router);
 }

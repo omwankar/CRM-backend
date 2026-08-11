@@ -311,6 +311,101 @@ async function upsertMailbox(user: GraphUser): Promise<string> {
   return data.id as string;
 }
 
+/** Extract phone number from text — matches common formats */
+function extractPhone(text: string): string | null {
+  const match = text.match(
+    /(?:tel|phone|ph|mob|mobile|cell|t|m|p)[\s.:]*([+\d][\d\s\-()+]{6,})/i,
+  );
+  if (match) return match[1].trim().replace(/\s+/g, " ");
+  // fallback: bare phone-like pattern (7+ digits, may have + prefix)
+  const bare = text.match(/(?<!\w)(\+?[\d][\d\s\-().]{7,}(?:\d))(?!\w)/);
+  return bare ? bare[1].trim() : null;
+}
+
+/** Extract company name from a signature block */
+function extractCompany(text: string): string | null {
+  // "Company: Acme Ltd" or "Organisation: Acme" style
+  const labeled = text.match(
+    /(?:company|organisation|organization|firm|corp|inc|llc|ltd)[\s.:]+([^\n|,]{3,60})/i,
+  );
+  if (labeled) return labeled[1].trim();
+
+  // Lines that look like company names: contain Ltd/Inc/LLC/Group/Corp/Solutions/Shipping etc.
+  const lines = text.split(/\n|\|/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (
+      /\b(ltd|llc|inc|corp|group|solutions|shipping|international|trading|global|industries|services|consultancy|associates|partners|plc|gmbh|bv|pvt)\b/i.test(
+        line,
+      ) &&
+      line.length < 80
+    ) {
+      return line;
+    }
+  }
+  return null;
+}
+
+/** Strip HTML tags and decode basic entities */
+function htmlToText(html: string): string {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
+/** Extract the signature block — heuristic: last 30 lines after common delimiters */
+function extractSignatureBlock(bodyText: string): string {
+  const delimiters = [
+    /^--\s*$/m,
+    /^_{2,}$/m,
+    /^-{2,}$/m,
+    /best regards?[,:]?/im,
+    /kind regards?[,:]?/im,
+    /regards?[,:]?/im,
+    /thanks?[,:]?/im,
+    /warm regards?[,:]?/im,
+    /sincerely[,:]?/im,
+    /cheers[,:]?/im,
+  ];
+
+  for (const delimiter of delimiters) {
+    const idx = bodyText.search(delimiter);
+    if (idx !== -1) {
+      return bodyText.slice(idx).slice(0, 800);
+    }
+  }
+
+  // No delimiter — use the last 20 lines
+  const lines = bodyText.split("\n");
+  return lines.slice(Math.max(0, lines.length - 20)).join("\n").slice(0, 800);
+}
+
+function parseSignature(msg: GraphMessage): { sig_phone: string | null; sig_company: string | null } {
+  const bodyContent = msg.body?.content || "";
+  const bodyText =
+    msg.body?.contentType?.toLowerCase() === "html"
+      ? htmlToText(bodyContent)
+      : bodyContent || msg.bodyPreview || "";
+
+  if (!bodyText) return { sig_phone: null, sig_company: null };
+
+  const sigBlock = extractSignatureBlock(bodyText);
+  return {
+    sig_phone: extractPhone(sigBlock),
+    sig_company: extractCompany(sigBlock),
+  };
+}
+
 function mapMessage(
   msg: GraphMessage,
   mailboxId: string,
@@ -324,6 +419,10 @@ function mapMessage(
   const direction =
     senderEmail && senderEmail === mailboxEmail.toLowerCase() ? "outbound" : "inbound";
 
+  const bodyContent = msg.body?.content || null;
+  const isHtml = msg.body?.contentType?.toLowerCase() === "html";
+  const { sig_phone, sig_company } = parseSignature(msg);
+
   return {
     graph_message_id: msg.id,
     internet_message_id: msg.internetMessageId || null,
@@ -336,6 +435,10 @@ function mapMessage(
     to_emails: toEmails,
     cc_emails: ccEmails,
     body_preview: msg.bodyPreview || null,
+    body_html: isHtml ? bodyContent : null,
+    body_text: isHtml ? null : bodyContent,
+    sig_phone,
+    sig_company,
     received_at: receivedAt,
     is_read: Boolean(msg.isRead),
     has_attachments: Boolean(msg.hasAttachments),
@@ -351,7 +454,7 @@ async function fetchMessagesSince(
 ): Promise<GraphMessage[]> {
   const messages: GraphMessage[] = [];
   const select =
-    "id,subject,from,toRecipients,ccRecipients,bodyPreview,receivedDateTime,sentDateTime,isRead,hasAttachments,conversationId,internetMessageId";
+    "id,subject,from,toRecipients,ccRecipients,body,bodyPreview,receivedDateTime,sentDateTime,isRead,hasAttachments,conversationId,internetMessageId";
   const filter = encodeURIComponent(`receivedDateTime ge ${sinceIso}`);
   let path: string | null =
     `/users/${graphUserId}/messages?$top=50&$orderby=receivedDateTime asc&$select=${select}&$filter=${filter}`;
