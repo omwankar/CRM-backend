@@ -407,19 +407,40 @@ router.patch("/:id/link", requireRole("manager", "super_admin"), async (req, res
 router.get("/contacts-extract", requireRole("manager", "super_admin"), async (req, res) => {
   const scopedMailbox = isSuperAdmin(req) ? null : callerMailboxEmail(req);
 
-  let query = supabase
-    .from("company_emails")
-    .select("sender_name, sender_email, sig_phone, sig_company")
-    .not("sender_email", "is", null)
-    .neq("sender_email", "")
-    .eq("direction", "inbound");
+  // Page through all rows (Supabase caps a single select at 1000).
+  // Fall back to base columns if sig_phone/sig_company don't exist yet (migration not run).
+  const PAGE = 1000;
+  let columns = "sender_name, sender_email, sig_phone, sig_company";
+  let data: Array<Record<string, unknown>> = [];
 
-  if (scopedMailbox) {
-    query = query.ilike("mailbox_email", scopedMailbox);
+  for (let from = 0; ; from += PAGE) {
+    let query = supabase
+      .from("company_emails")
+      .select(columns)
+      .not("sender_email", "is", null)
+      .neq("sender_email", "")
+      .eq("direction", "inbound")
+      .range(from, from + PAGE - 1);
+
+    if (scopedMailbox) {
+      query = query.ilike("mailbox_email", scopedMailbox);
+    }
+
+    const { data: page, error } = await query;
+    if (error) {
+      const msg = String(error.message || "");
+      if (from === 0 && /sig_phone|sig_company|column/i.test(msg) && columns.includes("sig_phone")) {
+        // Signature columns missing — retry without them
+        columns = "sender_name, sender_email";
+        from = -PAGE; // loop increment brings this back to 0
+        continue;
+      }
+      return res.status(500).json({ error: msg });
+    }
+
+    data = data.concat((page || []) as Array<Record<string, unknown>>);
+    if (!page || page.length < PAGE) break;
   }
-
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error: error.message });
 
   // Deduplicate by lower-cased email, merging best available phone/company per sender
   const map = new Map<
@@ -427,33 +448,32 @@ router.get("/contacts-extract", requireRole("manager", "super_admin"), async (re
     { name: string | null; email: string; phone: string | null; company: string | null; count: number }
   >();
 
-  for (const row of data || []) {
-    const key = (row.sender_email as string).toLowerCase();
+  for (const row of data) {
+    const email = String(row.sender_email || "");
+    if (!email) continue;
+    const key = email.toLowerCase();
+    const name = row.sender_name ? String(row.sender_name) : null;
+    const phone = row.sig_phone ? String(row.sig_phone) : null;
+    const company = row.sig_company ? String(row.sig_company) : null;
     const existing = map.get(key);
     if (!existing) {
-      map.set(key, {
-        name: row.sender_name || null,
-        email: row.sender_email as string,
-        phone: row.sig_phone || null,
-        company: row.sig_company || null,
-        count: 1,
-      });
+      map.set(key, { name, email, phone, company, count: 1 });
     } else {
       existing.count += 1;
-      if (!existing.phone && row.sig_phone) existing.phone = row.sig_phone;
-      if (!existing.company && row.sig_company) existing.company = row.sig_company;
-      if (!existing.name && row.sender_name) existing.name = row.sender_name;
+      if (!existing.phone && phone) existing.phone = phone;
+      if (!existing.company && company) existing.company = company;
+      if (!existing.name && name) existing.name = name;
     }
   }
 
-  // Check which emails already exist as contacts
+  // Check which emails already exist as contacts (chunked — the list can be large)
   const allEmails = [...map.keys()];
   const existingContacts = new Set<string>();
-  if (allEmails.length) {
+  for (let i = 0; i < allEmails.length; i += 500) {
     const { data: contacts } = await supabase
       .from("contacts")
       .select("email")
-      .in("email", allEmails);
+      .in("email", allEmails.slice(i, i + 500));
     for (const c of contacts || []) {
       if (c.email) existingContacts.add((c.email as string).toLowerCase());
     }
