@@ -438,7 +438,7 @@ router.get("/contacts-extract", requireRole("manager", "super_admin"), async (re
       return res.status(500).json({ error: msg });
     }
 
-    data = data.concat((page || []) as Array<Record<string, unknown>>);
+    data = data.concat((page || []) as unknown as Array<Record<string, unknown>>);
     if (!page || page.length < PAGE) break;
   }
 
