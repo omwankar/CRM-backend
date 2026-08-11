@@ -311,48 +311,122 @@ async function upsertMailbox(user: GraphUser): Promise<string> {
   return data.id as string;
 }
 
-/** Extract phone number from text — matches common formats */
+/** Prefer mobile, then labeled phone, then any international number */
 function extractPhone(text: string): string | null {
-  const match = text.match(
-    /(?:tel|phone|ph|mob|mobile|cell|t|m|p)[\s.:]*([+\d][\d\s\-()+]{6,})/i,
-  );
-  if (match) return match[1].trim().replace(/\s+/g, " ");
-  // fallback: bare phone-like pattern (7+ digits, may have + prefix)
-  const bare = text.match(/(?<!\w)(\+?[\d][\d\s\-().]{7,}(?:\d))(?!\w)/);
-  return bare ? bare[1].trim() : null;
-}
+  const clean = (n: string) => n.replace(/\s+/g, " ").trim();
 
-/** Extract company name from a signature block */
-function extractCompany(text: string): string | null {
-  // "Company: Acme Ltd" or "Organisation: Acme" style
+  // "+44 (0) 741 845 5773 (mobile)" / "+91 98xxx (mobile)" — prefer mobile
+  const mobileLabeled = text.match(
+    /(\+?\d[\d\s().\-\/]{6,}\d)\s*\(\s*mobile\s*\)/i,
+  );
+  if (mobileLabeled) return clean(mobileLabeled[1]);
+
+  const phoneLabeled = text.match(
+    /(\+?\d[\d\s().\-\/]{6,}\d)\s*\(\s*phone\s*\)/i,
+  );
+  if (phoneLabeled) return clean(phoneLabeled[1]);
+
+  // "Mobile: +91..." / "Tel: +1..." / "WhatsApp: +971..."
   const labeled = text.match(
-    /(?:company|organisation|organization|firm|corp|inc|llc|ltd)[\s.:]+([^\n|,]{3,60})/i,
+    /(?:whatsapp|mobile|mob|cell|tel|telephone|phone|ph\.?|m\.?|t\.?)[\s.:]*(\+?\d[\d\s\-().\/]{6,}\d)/i,
   );
-  if (labeled) return labeled[1].trim();
+  if (labeled) return clean(labeled[1]);
 
-  // Lines that look like company names: contain Ltd/Inc/LLC/Group/Corp/Solutions/Shipping etc.
-  const lines = text.split(/\n|\|/).map((l) => l.trim()).filter(Boolean);
-  for (const line of lines) {
-    if (
-      /\b(ltd|llc|inc|corp|group|solutions|shipping|international|trading|global|industries|services|consultancy|associates|partners|plc|gmbh|bv|pvt)\b/i.test(
-        line,
-      ) &&
-      line.length < 80
-    ) {
-      return line;
-    }
+  // tel: link leftover (any country)
+  const telLink = text.match(/tel:([+\d][\d\-().\s\/]{6,}\d)/i);
+  if (telLink) return clean(telLink[1]);
+
+  // Any international number starting with + (most reliable across countries)
+  const intl = text.match(/(?<!\w)(\+\d{1,4}[\s\-().\/]*\d[\d\s\-().\/]{5,}\d)/);
+  if (intl) return clean(intl[1]);
+
+  // Local numbers without + (7+ digits after stripping separators)
+  const bare = text.match(/(?<!\w)(\(?0?\d[\d\s\-().\/]{6,}\d)(?!\w)/);
+  if (bare) {
+    const digits = bare[1].replace(/\D/g, "");
+    if (digits.length >= 7 && digits.length <= 15) return clean(bare[1]);
   }
+
   return null;
 }
 
-/** Strip HTML tags and decode basic entities */
+/** Extract company name from a signature block like Clarusto-style HTML signatures */
+function extractCompany(text: string): string | null {
+  // Explicit label
+  const labeled = text.match(
+    /(?:company|organisation|organization|firm)[\s.:]+([^\n|,]{3,80})/i,
+  );
+  if (labeled) {
+    const v = labeled[1].trim();
+    if (v.length >= 3) return v;
+  }
+
+  // Website → company guess: www.clorustologistics.com → Clorustologistics
+  let webCompany: string | null = null;
+  const web = text.match(
+    /(?:https?:\/\/)?(?:www\.)?([a-z0-9][a-z0-9\-]+)\.(?:com|co\.uk|uk|net|io|org)\b/i,
+  );
+  if (web) {
+    const host = web[1];
+    // skip free mail / social / common non-company hosts
+    if (
+      !/^(gmail|google|yahoo|hotmail|outlook|live|linkedin|twitter|facebook|instagram|youtube|bit|tinyurl)$/i.test(
+        host,
+      )
+    ) {
+      webCompany = host.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+  }
+
+  // Lines that look like company names (Logistics, Shipping, Ltd, etc.)
+  const lines = text
+    .split(/\n|\|/)
+    .map((l) => l.trim())
+    .filter((l) => l.length >= 3 && l.length < 80);
+
+  const companyWord =
+    /\b(ltd|llc|inc|corp|group|solutions|shipping|logistics|international|trading|global|industries|services|consultancy|associates|partners|plc|gmbh|bv|pvt|freight|haulage|transport)\b/i;
+
+  for (const line of lines) {
+    // skip phone / email / address-ish / social lines
+    if (/@|^\+?\d|www\.|https?:|linkedin|instagram|facebook|twitter|company number|eori|vat number/i.test(line)) {
+      continue;
+    }
+    if (companyWord.test(line)) return line;
+  }
+
+  // Person name often sits above title above company:
+  // "Vikraam Chouhan\nBusiness Operations\nClorusto Logistics"
+  for (let i = 0; i < lines.length - 1; i++) {
+    const next = lines[i + 1];
+    if (
+      /^(business|operations|director|manager|sales|ceo|cfo|coo|founder|partner|consultant|executive)/i.test(
+        lines[i],
+      ) &&
+      next &&
+      !/@|^\+?\d|www\./i.test(next) &&
+      next.split(/\s+/).length <= 6
+    ) {
+      return next;
+    }
+  }
+
+  return webCompany;
+}
+
+/** Strip HTML tags and decode basic entities — keep tel:/mailto: values */
 function htmlToText(html: string): string {
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    // Preserve phone/email from links before stripping tags
+    .replace(/<a[^>]+href=["']tel:([^"']+)["'][^>]*>/gi, " $1 ")
+    .replace(/<a[^>]+href=["']mailto:([^"']+)["'][^>]*>/gi, " $1 ")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/p>/gi, "\n")
     .replace(/<\/div>/gi, "\n")
+    .replace(/<\/tr>/gi, "\n")
+    .replace(/<\/td>/gi, " | ")
     .replace(/<[^>]+>/g, "")
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
@@ -360,10 +434,12 @@ function htmlToText(html: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-/** Extract the signature block — heuristic: last 30 lines after common delimiters */
+/** Extract the signature block after Regards / -- etc. */
 function extractSignatureBlock(bodyText: string): string {
   const delimiters = [
     /^--\s*$/m,
@@ -371,9 +447,9 @@ function extractSignatureBlock(bodyText: string): string {
     /^-{2,}$/m,
     /best regards?[,:]?/im,
     /kind regards?[,:]?/im,
+    /warm regards?[,:]?/im,
     /regards?[,:]?/im,
     /thanks?[,:]?/im,
-    /warm regards?[,:]?/im,
     /sincerely[,:]?/im,
     /cheers[,:]?/im,
   ];
@@ -381,13 +457,13 @@ function extractSignatureBlock(bodyText: string): string {
   for (const delimiter of delimiters) {
     const idx = bodyText.search(delimiter);
     if (idx !== -1) {
-      return bodyText.slice(idx).slice(0, 800);
+      // HTML signatures can be long (logo + address + VAT etc.)
+      return bodyText.slice(idx).slice(0, 2500);
     }
   }
 
-  // No delimiter — use the last 20 lines
   const lines = bodyText.split("\n");
-  return lines.slice(Math.max(0, lines.length - 20)).join("\n").slice(0, 800);
+  return lines.slice(Math.max(0, lines.length - 35)).join("\n").slice(0, 2500);
 }
 
 function parseSignatureFromContent(input: {
