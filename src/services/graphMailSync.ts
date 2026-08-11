@@ -314,51 +314,60 @@ async function upsertMailbox(user: GraphUser): Promise<string> {
 /** Prefer mobile, then labeled phone, then any international number */
 function extractPhone(text: string): string | null {
   const clean = (n: string) => n.replace(/\s+/g, " ").trim();
+  const isValid = (n: string) => {
+    const digits = n.replace(/\D/g, "");
+    // E.164 allows up to 15 digits; reject junk like "1801)) ("
+    return digits.length >= 8 && digits.length <= 15;
+  };
 
   // "+44 (0) 741 845 5773 (mobile)" / "+91 98xxx (mobile)" — prefer mobile
   const mobileLabeled = text.match(
     /(\+?\d[\d\s().\-\/]{6,}\d)\s*\(\s*mobile\s*\)/i,
   );
-  if (mobileLabeled) return clean(mobileLabeled[1]);
+  if (mobileLabeled && isValid(mobileLabeled[1])) return clean(mobileLabeled[1]);
 
   const phoneLabeled = text.match(
     /(\+?\d[\d\s().\-\/]{6,}\d)\s*\(\s*phone\s*\)/i,
   );
-  if (phoneLabeled) return clean(phoneLabeled[1]);
+  if (phoneLabeled && isValid(phoneLabeled[1])) return clean(phoneLabeled[1]);
 
   // "Mobile: +91..." / "Tel: +1..." / "WhatsApp: +971..."
   const labeled = text.match(
     /(?:whatsapp|mobile|mob|cell|tel|telephone|phone|ph\.?|m\.?|t\.?)[\s.:]*(\+?\d[\d\s\-().\/]{6,}\d)/i,
   );
-  if (labeled) return clean(labeled[1]);
+  if (labeled && isValid(labeled[1])) return clean(labeled[1]);
 
   // tel: link leftover (any country)
   const telLink = text.match(/tel:([+\d][\d\-().\s\/]{6,}\d)/i);
-  if (telLink) return clean(telLink[1]);
+  if (telLink && isValid(telLink[1])) return clean(telLink[1]);
 
   // Any international number starting with + (most reliable across countries)
   const intl = text.match(/(?<!\w)(\+\d{1,4}[\s\-().\/]*\d[\d\s\-().\/]{5,}\d)/);
-  if (intl) return clean(intl[1]);
+  if (intl && isValid(intl[1])) return clean(intl[1]);
 
-  // Local numbers without + (7+ digits after stripping separators)
+  // Local numbers without + (8–15 digits)
   const bare = text.match(/(?<!\w)(\(?0?\d[\d\s\-().\/]{6,}\d)(?!\w)/);
-  if (bare) {
-    const digits = bare[1].replace(/\D/g, "");
-    if (digits.length >= 7 && digits.length <= 15) return clean(bare[1]);
-  }
+  if (bare && isValid(bare[1])) return clean(bare[1]);
 
   return null;
 }
 
 /** Extract company name from a signature block like Clarusto-style HTML signatures */
 function extractCompany(text: string): string | null {
-  // Explicit label
+  // Explicit label — but NOT "Company number" / VAT / EORI registration lines
   const labeled = text.match(
-    /(?:company|organisation|organization|firm)[\s.:]+([^\n|,]{3,80})/i,
+    /(?:^|\n)\s*(?:company|organisation|organization|firm)\s*[:\-]\s*([^\n|,]{3,80})/im,
   );
   if (labeled) {
     const v = labeled[1].trim();
-    if (v.length >= 3) return v;
+    if (
+      v.length >= 3 &&
+      !/^(number|no\.?|reg|registration|vat|eori)\b/i.test(v) &&
+      !/^SC\d+/i.test(v) &&
+      !/^GB\d+/i.test(v)
+    ) {
+      return v;
+    }
   }
 
   // Website → company guess: www.clorustologistics.com → Clorustologistics
@@ -388,15 +397,19 @@ function extractCompany(text: string): string | null {
     /\b(ltd|llc|inc|corp|group|solutions|shipping|logistics|international|trading|global|industries|services|consultancy|associates|partners|plc|gmbh|bv|pvt|freight|haulage|transport)\b/i;
 
   for (const line of lines) {
-    // skip phone / email / address-ish / social lines
-    if (/@|^\+?\d|www\.|https?:|linkedin|instagram|facebook|twitter|company number|eori|vat number/i.test(line)) {
+    // skip phone / email / address / registration / social lines
+    if (
+      /@|^\+?\d|www\.|https?:|linkedin|instagram|facebook|twitter|company\s*number|eori|vat\s*number|registration|^\(?\d{1,4}\)?\s*[),]/i.test(
+        line,
+      )
+    ) {
       continue;
     }
     if (companyWord.test(line)) return line;
   }
 
-  // Person name often sits above title above company:
-  // "Vikraam Chouhan\nBusiness Operations\nClorusto Logistics"
+  // Title line often sits above company:
+  // "Business Operations\nClorusto Logistics"
   for (let i = 0; i < lines.length - 1; i++) {
     const next = lines[i + 1];
     if (
@@ -404,7 +417,7 @@ function extractCompany(text: string): string | null {
         lines[i],
       ) &&
       next &&
-      !/@|^\+?\d|www\./i.test(next) &&
+      !/@|^\+?\d|www\.|company\s*number|vat|eori/i.test(next) &&
       next.split(/\s+/).length <= 6
     ) {
       return next;
