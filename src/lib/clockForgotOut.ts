@@ -51,6 +51,19 @@ type Sb = {
 export const FORGOT_CLOCK_OUT_LOCK_MESSAGE =
   "You forgot to clock out. An automatic punch request was sent to super admin. You can clock in and out again after it is approved.";
 
+export async function hasPendingAutomaticClockOutRequest(supabase: Sb, userId: string) {
+  const { data } = await supabase
+    .from("missed_punch_requests")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("type", "clock_out")
+    .eq("status", "pending")
+    .ilike("reason", "Automatic:%")
+    .limit(1)
+    .maybeSingle();
+  return Boolean(data?.id);
+}
+
 export async function ensureForgotClockOutPunchRequest(
   supabase: Sb,
   session: { id: string; user_id: string; clock_in: string },
@@ -146,4 +159,42 @@ export async function createPunchRequestsForStaleSessions(supabase: Sb) {
     if (result.created) created += 1;
   }
   return { stale: stale.length, created };
+}
+
+/**
+ * End of day: clock out every open session and raise a punch request
+ * so super admin can unlock the employee the next day.
+ */
+export async function autoClockOutAtEod(supabase: Sb) {
+  const { data: openSessions, error } = await supabase
+    .from("clock_sessions")
+    .select("id, user_id, clock_in")
+    .is("clock_out", null);
+
+  if (error) throw new Error(error.message);
+  if (!openSessions?.length) {
+    return { closed: 0, punchRequests: 0 };
+  }
+
+  let closed = 0;
+  let punchRequests = 0;
+
+  for (const session of openSessions) {
+    const punch = await ensureForgotClockOutPunchRequest(supabase, session);
+    if (punch.created) punchRequests += 1;
+
+    const outAt = suggestedClockOutIso(session.clock_in);
+    const { error: updateError } = await supabase
+      .from("clock_sessions")
+      .update({
+        clock_out: outAt,
+        notes: "Automatic clock-out at end of day (UK). Pending super admin punch approval.",
+      })
+      .eq("id", session.id)
+      .is("clock_out", null);
+
+    if (!updateError) closed += 1;
+  }
+
+  return { closed, punchRequests, open: openSessions.length };
 }

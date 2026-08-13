@@ -1,6 +1,6 @@
 import cron from "node-cron";
 import { createClient } from "@supabase/supabase-js";
-import { createPunchRequestsForStaleSessions } from "../lib/clockForgotOut.js";
+import { autoClockOutAtEod } from "../lib/clockForgotOut.js";
 
 const UK_TIME_ZONE = "Europe/London";
 const DEFAULT_SCHEDULE = "0 9 * * *";
@@ -23,9 +23,9 @@ export function startClockOpenSessionWarningCron() {
     valid ? schedule : DEFAULT_SCHEDULE,
     async () => {
       try {
-        const result = await createPunchRequestsForStaleSessions(supabase);
+        const result = await autoClockOutAtEod(supabase);
         console.log(
-          `[clock-forgot-out] morning check stale=${result.stale} created=${result.created}`,
+          `[clock-eod] morning sweep closed=${result.closed} punch_requests=${result.punchRequests}`,
         );
       } catch (err) {
         console.error("[clock-forgot-out] Morning check failed:", err instanceof Error ? err.message : err);

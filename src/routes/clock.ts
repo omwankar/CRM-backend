@@ -9,6 +9,7 @@ import { computeAttendanceGrid } from '../lib/attendanceGrid.js';
 import {
   FORGOT_CLOCK_OUT_LOCK_MESSAGE,
   ensureForgotClockOutPunchRequest,
+  hasPendingAutomaticClockOutRequest,
   isStaleOpenSession,
 } from '../lib/clockForgotOut.js';
 
@@ -231,6 +232,10 @@ router.post('/clock-in', async (req, res) => {
       return res.status(400).json({ error: FORGOT_CLOCK_OUT_LOCK_MESSAGE });
     }
     return res.status(400).json({ error: 'You are already clocked in. Clock out first.' });
+  }
+
+  if (await hasPendingAutomaticClockOutRequest(supabase, userId)) {
+    return res.status(400).json({ error: FORGOT_CLOCK_OUT_LOCK_MESSAGE });
   }
 
   const { data, error } = await supabase
