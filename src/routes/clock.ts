@@ -6,6 +6,11 @@ import { auditLog } from '../middleware/auditLog.js';
 import { computeWorkingDays, getHolidayDatesInRange, getLeaveUsage } from '../lib/leave.js';
 import { computeEmployeeMonthAttendance } from '../lib/attendanceCompute.js';
 import { computeAttendanceGrid } from '../lib/attendanceGrid.js';
+import {
+  FORGOT_CLOCK_OUT_LOCK_MESSAGE,
+  ensureForgotClockOutPunchRequest,
+  isStaleOpenSession,
+} from '../lib/clockForgotOut.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -216,11 +221,15 @@ router.post('/clock-in', async (req, res) => {
 
   const { data: openSession } = await supabase
     .from('clock_sessions')
-    .select('id')
+    .select('id, user_id, clock_in')
     .eq('user_id', userId)
     .is('clock_out', null)
     .maybeSingle();
   if (openSession) {
+    if (isStaleOpenSession(openSession.clock_in)) {
+      await ensureForgotClockOutPunchRequest(supabase, openSession);
+      return res.status(400).json({ error: FORGOT_CLOCK_OUT_LOCK_MESSAGE });
+    }
     return res.status(400).json({ error: 'You are already clocked in. Clock out first.' });
   }
 
@@ -246,14 +255,27 @@ router.post('/clock-out', async (req, res) => {
   const parsed = clockOutSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
 
+  const { data: openSession } = await supabase
+    .from('clock_sessions')
+    .select('id, user_id, clock_in')
+    .eq('user_id', userId)
+    .is('clock_out', null)
+    .maybeSingle();
+
+  if (!openSession) return res.status(404).json({ error: 'No active session found' });
+
+  if (isStaleOpenSession(openSession.clock_in)) {
+    await ensureForgotClockOutPunchRequest(supabase, openSession);
+    return res.status(400).json({ error: FORGOT_CLOCK_OUT_LOCK_MESSAGE });
+  }
+
   const { data, error } = await supabase
     .from('clock_sessions')
     .update({
       clock_out: new Date().toISOString(),
       notes: parsed.data.notes,
     })
-    .eq('user_id', userId)
-    .is('clock_out', null)
+    .eq('id', openSession.id)
     .select()
     .single();
 
@@ -400,20 +422,19 @@ router.put('/punch-requests/:id/approve', async (req, res) => {
     });
     sessionApplied = true;
   } else if (request.type === 'clock_out' && request.requested_at) {
-    // Close the most recent session that started before the requested time
+    const outAt = request.requested_clock_out || request.requested_at;
     const { data: openSession } = await supabase
       .from('clock_sessions')
       .select('id, clock_in')
       .eq('user_id', request.user_id)
       .is('clock_out', null)
-      .lte('clock_in', request.requested_at)
       .order('clock_in', { ascending: false })
       .limit(1)
       .maybeSingle();
     if (openSession) {
       await supabase
         .from('clock_sessions')
-        .update({ clock_out: request.requested_at, notes: 'Approved punch request' })
+        .update({ clock_out: outAt, notes: 'Approved punch request (forgot clock-out)' })
         .eq('id', openSession.id);
       sessionApplied = true;
     }
@@ -424,7 +445,7 @@ router.put('/punch-requests/:id/approve', async (req, res) => {
     user_id: request.user_id,
     type: 'punch_approved',
     title: 'Punch Request Approved',
-    message: `Your punch request has been approved.`,
+    message: `Your punch request has been approved. You can clock in and out again.`,
   });
 
   // Activity log
