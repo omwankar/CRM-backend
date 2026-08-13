@@ -684,8 +684,9 @@ export async function backfillEmailSignatures(options: {
         }
 
         const patch: Record<string, unknown> = {};
-        if (bodyHtml && bodyHtml !== row.body_html) patch.body_html = bodyHtml;
-        if (bodyText && bodyText !== row.body_text) patch.body_text = bodyText;
+        // Never keep full bodies in DB after parse
+        if (row.body_html) patch.body_html = null;
+        if (row.body_text) patch.body_text = null;
 
         if (force) {
           if (sig_phone !== existingPhone) patch.sig_phone = sig_phone;
@@ -784,8 +785,6 @@ function mapMessage(
   const direction =
     senderEmail && senderEmail === mailboxEmail.toLowerCase() ? "outbound" : "inbound";
 
-  const bodyContent = msg.body?.content || null;
-  const isHtml = msg.body?.contentType?.toLowerCase() === "html";
   const parsed = parseSignature(msg);
   const senderName = msg.from?.emailAddress?.name || null;
   const sig_phone = parsed.sig_phone;
@@ -803,8 +802,9 @@ function mapMessage(
     to_emails: toEmails,
     cc_emails: ccEmails,
     body_preview: msg.bodyPreview || null,
-    body_html: isHtml ? bodyContent : null,
-    body_text: isHtml ? null : bodyContent,
+    // Do not persist full HTML — it bloats the DB. Body is fetched from Graph on open.
+    body_html: null,
+    body_text: null,
     sig_phone,
     sig_company,
     received_at: receivedAt,

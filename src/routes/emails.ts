@@ -341,10 +341,7 @@ router.get("/:id", async (req, res) => {
     if (graphUserId) {
       try {
         const body = await fetchMessageBody(graphUserId, email.graph_message_id);
-        await supabase
-          .from("company_emails")
-          .update({ body_html: body.body_html, body_text: body.body_text })
-          .eq("id", email.id);
+        // Return body to the client only — do not store HTML in the database
         email.body_html = body.body_html;
         email.body_text = body.body_text;
       } catch (err) {
