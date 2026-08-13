@@ -5,6 +5,34 @@ const supabaseUrl = process.env.SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+type AuthUser = {
+  id: string;
+  email: string;
+  role: string;
+  full_name: string | null;
+};
+
+const AUTH_CACHE_TTL_MS = 45_000;
+const authCache = new Map<string, { user: AuthUser; expiresAt: number }>();
+
+function cacheGet(token: string): AuthUser | null {
+  const hit = authCache.get(token);
+  if (!hit) return null;
+  if (hit.expiresAt < Date.now()) {
+    authCache.delete(token);
+    return null;
+  }
+  return hit.user;
+}
+
+function cacheSet(token: string, user: AuthUser) {
+  if (authCache.size > 500) {
+    const first = authCache.keys().next().value;
+    if (first) authCache.delete(first);
+  }
+  authCache.set(token, { user, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
+}
+
 // Extend Express Request type
 declare global {
   namespace Express {
@@ -28,6 +56,13 @@ export const authMiddleware: RequestHandler = async (req, res, next) => {
     }
 
     const token = authHeader.split(' ')[1];
+
+    const cached = cacheGet(token);
+    if (cached) {
+      req.user = cached;
+      next();
+      return;
+    }
 
     // Verify token with Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token);
@@ -66,6 +101,7 @@ export const authMiddleware: RequestHandler = async (req, res, next) => {
       role,
       full_name: userData.full_name || null,
     };
+    cacheSet(token, req.user);
 
     next();
   } catch {

@@ -10,14 +10,17 @@ router.use(authMiddleware);
 // GET /stats — dashboard statistics
 router.get('/stats', async (req, res) => {
   const userId = req.user?.id;
-  const userRole = req.user?.role;
 
   try {
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Get counts for all modules
+    const today = new Date().toISOString().split('T')[0];
+    const nextWeek = new Date();
+    nextWeek.setDate(nextWeek.getDate() + 7);
+    const nextWeekStr = nextWeek.toISOString().split('T')[0];
+
     const [
       { count: projectsCount },
       { count: buyersCount },
@@ -29,29 +32,64 @@ router.get('/stats', async (req, res) => {
       { count: documentsCount },
       { count: alertsCount },
       { count: quotationsCount },
+      { data: todaySessions },
+      { data: pipelineData },
+      { data: recentActivity },
+      { data: upcomingEvents },
+      { data: myTasksRaw },
+      { data: myProjectsRaw },
     ] = await Promise.all([
-      supabase.from('projects').select('*', { count: 'exact', head: true }).is('deleted_at', null),
-      supabase.from('buyers').select('*', { count: 'exact', head: true }).is('deleted_at', null),
-      supabase.from('vendors').select('*', { count: 'exact', head: true }).is('deleted_at', null),
-      supabase.from('certifications').select('*', { count: 'exact', head: true }).is('deleted_at', null),
-      supabase.from('memberships').select('*', { count: 'exact', head: true }).is('deleted_at', null),
-      supabase.from('partnerships').select('*', { count: 'exact', head: true }).is('deleted_at', null),
-      supabase.from('insurance').select('*', { count: 'exact', head: true }).is('deleted_at', null),
-      supabase.from('documents').select('*', { count: 'exact', head: true }),
-      supabase.from('alerts').select('*', { count: 'exact', head: true }).eq('is_dismissed', false),
+      supabase.from('projects').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('buyers').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('vendors').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('certifications').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('memberships').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('partnerships').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('insurance').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('documents').select('id', { count: 'exact', head: true }),
+      supabase.from('alerts').select('id', { count: 'exact', head: true }).eq('is_dismissed', false),
       supabase
         .from('quotations')
-        .select('*', { count: 'exact', head: true })
+        .select('id', { count: 'exact', head: true })
         .not('status', 'in', '("approved","rejected","cancelled")'),
+      supabase
+        .from('clock_sessions')
+        .select('clock_in, clock_out')
+        .eq('user_id', userId)
+        .gte('clock_in', today),
+      supabase
+        .from('buyers')
+        .select('pipeline_stage_id, pipeline_stages(name, color, order_index)')
+        .is('deleted_at', null),
+      supabase
+        .from('activity_logs')
+        .select('id, action, created_at, users(full_name, email)')
+        .order('created_at', { ascending: false })
+        .limit(10),
+      supabase
+        .from('calendar_events')
+        .select('id, title, date, event_type')
+        .gte('date', today)
+        .lte('date', nextWeekStr)
+        .order('date', { ascending: true })
+        .limit(10),
+      supabase
+        .from('tasks')
+        .select('id, task_title, due_date, status')
+        .eq('assigned_person_id', userId)
+        .in('status', ['pending', 'in_progress', 'Pending', 'In Progress', 'On Hold'])
+        .is('deleted_at', null)
+        .order('due_date', { ascending: true })
+        .limit(10),
+      supabase
+        .from('projects')
+        .select('id, project_name, estimated_end_date, status')
+        .eq('assigned_person_id', userId)
+        .neq('status', 'Closed')
+        .is('deleted_at', null)
+        .order('estimated_end_date', { ascending: true })
+        .limit(10),
     ]);
-
-    // Get today's clocked hours
-    const today = new Date().toISOString().split('T')[0];
-    const { data: todaySessions } = await supabase
-      .from('clock_sessions')
-      .select('clock_in, clock_out')
-      .eq('user_id', userId)
-      .gte('clock_in', today);
 
     let hoursToday = 0;
     if (todaySessions) {
@@ -61,12 +99,6 @@ router.get('/stats', async (req, res) => {
         hoursToday += (clockOut.getTime() - clockIn.getTime()) / (1000 * 60 * 60);
       }
     }
-
-    // Get pipeline overview for buyers
-    const { data: pipelineData } = await supabase
-      .from('buyers')
-      .select('pipeline_stage_id, pipeline_stages(name, color, order_index)')
-      .is('deleted_at', null);
 
     const pipelineOverview: Record<string, { count: number; color: string; name: string }> = {};
     if (pipelineData) {
@@ -83,50 +115,12 @@ router.get('/stats', async (req, res) => {
       }
     }
 
-    // Get recent activity (last 10)
-    const { data: recentActivity } = await supabase
-      .from('activity_logs')
-      .select('*, users(full_name, email)')
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    // Get upcoming calendar events (next 7 days)
-    const nextWeek = new Date();
-    nextWeek.setDate(nextWeek.getDate() + 7);
-    const { data: upcomingEvents } = await supabase
-      .from('calendar_events')
-      .select('*')
-      .gte('date', today)
-      .lte('date', nextWeek.toISOString().split('T')[0])
-      .order('date', { ascending: true })
-      .limit(10);
-
-    // Get user's tasks (assigned_person_id in current schema)
-    const { data: myTasksRaw } = await supabase
-      .from('tasks')
-      .select('id, task_title, due_date, status')
-      .eq('assigned_person_id', userId)
-      .in('status', ['pending', 'in_progress', 'Pending', 'In Progress', 'On Hold'])
-      .is('deleted_at', null)
-      .order('due_date', { ascending: true })
-      .limit(10);
-
     const myTasks = (myTasksRaw || []).map((t: any) => ({
       id: t.id,
       title: t.task_title,
       due_date: t.due_date,
       status: t.status,
     }));
-
-    // Get user's projects (assigned_person_id)
-    const { data: myProjectsRaw } = await supabase
-      .from('projects')
-      .select('id, project_name, estimated_end_date, status')
-      .eq('assigned_person_id', userId)
-      .neq('status', 'Closed')
-      .is('deleted_at', null)
-      .order('estimated_end_date', { ascending: true })
-      .limit(10);
 
     const myProjects = (myProjectsRaw || []).map((p: any) => ({
       id: p.id,
