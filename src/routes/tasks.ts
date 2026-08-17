@@ -240,6 +240,8 @@ router.get('/', async (req, res) => {
   const p = Math.max(1, Number(page));
   const l = Math.min(200, Number(limit) || 50);
 
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
   if (view === 'team' && !isPrivileged(role)) {
     return res.status(403).json({ error: 'Team view requires manager access' });
   }
@@ -247,13 +249,15 @@ router.get('/', async (req, res) => {
   let query = supabase.from('tasks').select('*', { count: 'exact' }).is('deleted_at', null);
 
   if (view === 'mine') {
-    query = query.eq('assigned_person_id', userId!);
+    query = query.or(
+      `assigned_person_id.eq.${userId},created_by.eq.${userId},supervisor_id.eq.${userId}`,
+    );
   } else if (view === 'sales') {
-    query = query.in('entity_type', [...SALES_TYPES]);
+    query = query.or(`entity_type.is.null,entity_type.in.(${SALES_TYPES.join(',')})`);
   } else if (view === 'operations') {
-    query = query.in('entity_type', [...OPS_TYPES]);
+    query = query.or(`entity_type.is.null,entity_type.in.(${OPS_TYPES.join(',')})`);
   } else if (view === 'finance') {
-    query = query.in('entity_type', [...FINANCE_TYPES]);
+    query = query.or(`entity_type.is.null,entity_type.in.(${FINANCE_TYPES.join(',')})`);
   } else if (view === 'team') {
     // all tasks
   } else if (view === 'entity') {
