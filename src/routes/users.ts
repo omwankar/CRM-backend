@@ -67,19 +67,34 @@ const updateSchema = z.object({
   is_active: z.boolean().optional(),
 });
 
-// GET / — list users (super_admin only for full management)
+// GET / — list users.
+// Managers/super_admins get the full management payload.
+// Employees get a slim active-user directory (for assignee pickers).
 router.get('/', async (req, res) => {
+  if (!req.user?.id) return res.status(401).json({ error: 'Unauthorized' });
+
   const userRole = req.user?.role;
-  if (!['super_admin', 'admin', 'manager'].includes(userRole || '')) {
-    return res.status(403).json({ error: 'Forbidden' });
+  const isPrivileged = ['super_admin', 'admin', 'manager'].includes(userRole || '');
+  const { search, role, is_active, page = '1', limit } = req.query;
+  const p = Math.max(1, Number(page));
+  const l = Math.min(200, Number(limit) || (isPrivileged ? 20 : 200));
+
+  if (!isPrivileged) {
+    let query = supabase
+      .from('users')
+      .select('id, email, full_name, role', { count: 'exact' })
+      .eq('is_active', true);
+    if (search) query = query.or(`full_name.ilike.%${search}%,email.ilike.%${search}%`);
+    query = query.range((p - 1) * l, p * l - 1).order('full_name', { ascending: true });
+    const { data, count, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
   }
 
-  const { search, role, is_active, page = '1', limit = '20' } = req.query;
   let query = supabase.from('users').select('id, email, full_name, role, department, phone, is_active, last_login, invited_by, invited_at, avatar_url, created_at', { count: 'exact' });
   if (role) query = query.eq('role', role);
   if (is_active !== undefined) query = query.eq('is_active', is_active === 'true');
   if (search) query = query.or(`full_name.ilike.%${search}%,email.ilike.%${search}%`);
-  const p = Math.max(1, Number(page)), l = Math.min(100, Number(limit));
   query = query.range((p - 1) * l, p * l - 1).order('created_at', { ascending: false });
   const { data, count, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
