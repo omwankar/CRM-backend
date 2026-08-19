@@ -569,6 +569,36 @@ router.get('/:id/attachments', async (req, res) => {
   res.json({ data: data || [] });
 });
 
+function missingColumn(message: string) {
+  const match = String(message || '').match(/Could not find the '([^']+)' column/i)
+    || String(message || '').match(/column (?:[\w.]+\.)?([a-zA-Z0-9_]+) does not exist/i);
+  return match?.[1] || null;
+}
+
+async function insertTaskAttachment(row: Record<string, unknown>) {
+  let attempt = { ...row };
+  for (let i = 0; i < 6; i++) {
+    const { data, error } = await supabase.from('task_attachments').insert(attempt).select().single();
+    if (!error) return { data, error: null as null };
+    const col = missingColumn(error.message || '');
+    if (col && col in attempt) {
+      if (
+        col === 'folder' &&
+        typeof attempt.folder === 'string' &&
+        typeof attempt.file_name === 'string' &&
+        !String(attempt.file_name).startsWith(`${attempt.folder}/`)
+      ) {
+        attempt = { ...attempt, file_name: `${attempt.folder}/${attempt.file_name}` };
+      }
+      const { [col]: _removed, ...rest } = attempt;
+      attempt = rest;
+      continue;
+    }
+    return { data: null, error };
+  }
+  return { data: null, error: { message: 'Could not save the file. Please try again.' } };
+}
+
 router.post('/:id/attachments', async (req, res) => {
   const userId = req.user?.id;
   const role = req.user?.role;
@@ -583,22 +613,20 @@ router.post('/:id/attachments', async (req, res) => {
     return res.status(403).json({ error: 'You cannot add files to this task' });
   }
 
-  const { file_name, file_type, file_url, file_size } = req.body || {};
+  const { file_name, file_type, file_url, file_size, folder } = req.body || {};
   if (!file_name || !file_url) return res.status(400).json({ error: 'file_name and file_url are required' });
 
-  const { data, error } = await supabase
-    .from('task_attachments')
-    .insert({
-      task_id: req.params.id,
-      file_name,
-      file_type: file_type || null,
-      file_url,
-      file_size: file_size || 0,
-      uploaded_by: userId,
-    })
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
+  const folderName = typeof folder === 'string' && folder.trim() ? folder.trim().slice(0, 200) : null;
+  const { data, error } = await insertTaskAttachment({
+    task_id: req.params.id,
+    file_name,
+    file_type: file_type || null,
+    file_url,
+    file_size: file_size || 0,
+    uploaded_by: userId,
+    ...(folderName ? { folder: folderName } : {}),
+  });
+  if (error || !data) return res.status(500).json({ error: error?.message || 'Could not save the file.' });
 
   const actor = req.user?.full_name || req.user?.email || 'Someone';
   await notifySuperAdmins(
