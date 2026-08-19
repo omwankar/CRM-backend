@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
 import { attachLastActivityStats } from './activities.js';
+import { notifySuperAdmins } from '../lib/notifyAdmins.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -31,6 +32,14 @@ const updateLeadSchema = createLeadSchema.partial();
 
 const leadSelect =
   '*, assignee:users!leads_assigned_to_fkey(id, full_name), creator:users!leads_created_by_fkey(id, full_name)';
+
+function isPrivileged(role?: string) {
+  return role === 'manager' || role === 'super_admin' || role === 'admin';
+}
+
+function ownLeadFilter(userId: string) {
+  return `created_by.eq.${userId},assigned_to.eq.${userId}`;
+}
 
 async function notifyUser(userId: string, title: string, message: string) {
   await supabase.from('notifications').insert({
@@ -107,11 +116,17 @@ router.get('/', async (req, res) => {
   const p = Math.max(1, Number(page));
   const l = Math.min(200, Number(limit) || 50);
   const showTrash = trash === '1' || trash === 'true';
+  const userId = req.user?.id;
+  const role = req.user?.role;
 
   let query = supabase.from('leads').select(leadSelect, { count: 'exact' });
 
   if (showTrash) query = query.not('deleted_at', 'is', null);
   else query = query.is('deleted_at', null);
+
+  if (!isPrivileged(role) && userId) {
+    query = query.or(ownLeadFilter(userId));
+  }
 
   if (status && status !== 'all') query = query.eq('status', String(status));
   if (search) {
@@ -137,8 +152,14 @@ router.get('/', async (req, res) => {
 });
 
 // GET /api/leads/stats — counts by status (active only)
-router.get('/stats', async (_req, res) => {
-  const { data, error } = await supabase.from('leads').select('status').is('deleted_at', null);
+router.get('/stats', async (req, res) => {
+  let query = supabase.from('leads').select('status').is('deleted_at', null);
+  const userId = req.user?.id;
+  const role = req.user?.role;
+  if (!isPrivileged(role) && userId) {
+    query = query.or(ownLeadFilter(userId));
+  }
+  const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   const by: Record<string, number> = {};
   for (const row of data || []) by[row.status] = (by[row.status] || 0) + 1;
@@ -184,6 +205,13 @@ router.get('/:id', async (req, res) => {
     .maybeSingle();
 
   if (error || !data) return res.status(404).json({ error: 'Lead not found' });
+
+  const role = req.user?.role;
+  const userId = req.user?.id;
+  if (!isPrivileged(role) && userId && data.created_by !== userId && data.assigned_to !== userId) {
+    return res.status(403).json({ error: 'You do not have access to this lead' });
+  }
+
   res.json(await attachConvertedBuyer(data as Record<string, unknown>));
 });
 
@@ -262,6 +290,17 @@ router.put('/:id', async (req, res) => {
       assignedBy: userId,
       leadName: data.lead_name,
     });
+  }
+
+  const actor = req.user?.full_name || req.user?.email || 'Someone';
+  if (parsed.data.status && parsed.data.status !== existing.status) {
+    await notifySuperAdmins(
+      'lead',
+      'Lead status changed',
+      `${actor} set "${data.lead_name}" from ${existing.status} to ${parsed.data.status}.`,
+    );
+  } else if (parsed.data.notes !== undefined) {
+    await notifySuperAdmins('lead', 'Lead notes updated', `${actor} updated notes on "${data.lead_name}".`);
   }
 
   res.json(await attachConvertedBuyer(data as Record<string, unknown>));

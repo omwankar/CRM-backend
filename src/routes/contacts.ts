@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
+import { notifySuperAdmins } from '../lib/notifyAdmins.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -180,6 +181,12 @@ router.get('/', async (req, res) => {
 
   if (contactIdsFilter) query = query.in('id', contactIdsFilter);
 
+  const role = req.user?.role;
+  const userId = req.user?.id;
+  if (role === 'user' && userId) {
+    query = query.eq('created_by', userId);
+  }
+
   if (search) {
     const s = String(search).replace(/[%_,()]/g, ' ').trim();
     if (s) {
@@ -210,6 +217,11 @@ router.get('/:id', async (req, res) => {
     .eq('id', req.params.id)
     .maybeSingle();
   if (error || !data) return res.status(404).json({ error: 'Contact not found' });
+  const role = req.user?.role;
+  const userId = req.user?.id;
+  if (role === 'user' && userId && data.created_by !== userId) {
+    return res.status(403).json({ error: 'You do not have access to this contact' });
+  }
   const [withLinks] = await attachLinks([data]);
   res.json(withLinks);
 });
@@ -306,6 +318,12 @@ router.put('/:id', async (req, res) => {
   }
 
   const [enriched] = await attachLinks([data]);
+  const actor = req.user?.full_name || req.user?.email || 'Someone';
+  await notifySuperAdmins(
+    'contact',
+    body.notes !== undefined ? 'Contact notes updated' : 'Contact updated',
+    `${actor} updated contact "${data.full_name}".`,
+  );
   res.json(enriched);
 });
 

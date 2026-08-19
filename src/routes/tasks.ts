@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
+import { notifySuperAdmins } from '../lib/notifyAdmins.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -446,6 +447,17 @@ router.put('/:id', async (req, res) => {
     );
   }
 
+  const actor = req.user?.full_name || req.user?.email || 'Someone';
+  if (patch.status && patch.status !== existing.status) {
+    await notifySuperAdmins(
+      'task',
+      'Task status changed',
+      `${actor} set "${data.task_title}" from ${existing.status} to ${patch.status}.`,
+    );
+  } else if (Object.keys(patch).length) {
+    await notifySuperAdmins('task', 'Task updated', `${actor} updated task "${data.task_title}".`);
+  }
+
   const [enriched] = await enrichTasks([data]);
   res.json(enriched);
 });
@@ -508,6 +520,9 @@ router.post('/:id/complete', async (req, res) => {
     await notify(existing.supervisor_id, 'Task completed', `"${data.task_title}" was marked completed.`);
   }
 
+  const actor = req.user?.full_name || req.user?.email || 'Someone';
+  await notifySuperAdmins('task', 'Task completed', `${actor} completed "${data.task_title}".`);
+
   const [enriched] = await enrichTasks([data]);
   res.json(enriched);
 });
@@ -532,6 +547,87 @@ router.delete('/:id', async (req, res) => {
     .from('tasks')
     .update({ deleted_at: new Date().toISOString() })
     .eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+router.get('/:id/attachments', async (req, res) => {
+  const { data: task } = await supabase
+    .from('tasks')
+    .select('id')
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+
+  const { data, error } = await supabase
+    .from('task_attachments')
+    .select('*')
+    .eq('task_id', req.params.id)
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data: data || [] });
+});
+
+router.post('/:id/attachments', async (req, res) => {
+  const userId = req.user?.id;
+  const role = req.user?.role;
+  const { data: task } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  if (!canEdit(task, userId, role)) {
+    return res.status(403).json({ error: 'You cannot add files to this task' });
+  }
+
+  const { file_name, file_type, file_url, file_size } = req.body || {};
+  if (!file_name || !file_url) return res.status(400).json({ error: 'file_name and file_url are required' });
+
+  const { data, error } = await supabase
+    .from('task_attachments')
+    .insert({
+      task_id: req.params.id,
+      file_name,
+      file_type: file_type || null,
+      file_url,
+      file_size: file_size || 0,
+      uploaded_by: userId,
+    })
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  const actor = req.user?.full_name || req.user?.email || 'Someone';
+  await notifySuperAdmins(
+    'document',
+    'Task document uploaded',
+    `${actor} uploaded "${file_name}" on task "${task.task_title}".`,
+  );
+  res.status(201).json(data);
+});
+
+router.delete('/:id/attachments/:aid', async (req, res) => {
+  const userId = req.user?.id;
+  const role = req.user?.role;
+  const { data: task } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  if (!canEdit(task, userId, role) && !canDelete(task, userId, role)) {
+    return res.status(403).json({ error: 'You cannot delete files on this task' });
+  }
+
+  const { error } = await supabase
+    .from('task_attachments')
+    .delete()
+    .eq('id', req.params.aid)
+    .eq('task_id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });

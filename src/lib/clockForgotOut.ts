@@ -49,7 +49,25 @@ type Sb = {
 };
 
 export const FORGOT_CLOCK_OUT_LOCK_MESSAGE =
-  "You forgot to clock out. An automatic punch request was sent to super admin. You can clock in and out again after it is approved.";
+  "You forgot to clock out. Clock in is allowed — yesterday's session was closed automatically.";
+
+/** Close a leftover open session from a previous UK day so today's clock-in can proceed. */
+export async function closeStaleOpenSession(
+  supabase: Sb,
+  session: { id: string; clock_in: string },
+) {
+  if (!isStaleOpenSession(session.clock_in)) return false;
+  const { error } = await supabase
+    .from("clock_sessions")
+    .update({
+      clock_out: suggestedClockOutIso(session.clock_in),
+      notes: "Automatic clock-out (previous day session closed).",
+    })
+    .eq("id", session.id)
+    .is("clock_out", null);
+  if (error) throw new Error(error.message);
+  return true;
+}
 
 export async function hasPendingAutomaticClockOutRequest(supabase: Sb, userId: string) {
   const { data } = await supabase
@@ -153,17 +171,16 @@ export async function createPunchRequestsForStaleSessions(supabase: Sb) {
   if (error) throw new Error(error.message);
 
   const stale = (openSessions || []).filter((s: { clock_in: string }) => isStaleOpenSession(s.clock_in));
-  let created = 0;
+  let closed = 0;
   for (const session of stale) {
-    const result = await ensureForgotClockOutPunchRequest(supabase, session);
-    if (result.created) created += 1;
+    if (await closeStaleOpenSession(supabase, session)) closed += 1;
   }
-  return { stale: stale.length, created };
+  return { stale: stale.length, created: 0, closed };
 }
 
 /**
- * End of day: clock out every open session and raise a punch request
- * so super admin can unlock the employee the next day.
+ * End of day: clock out every open session. Employees can clock in next day
+ * without waiting for punch-request approval.
  */
 export async function autoClockOutAtEod(supabase: Sb) {
   const { data: openSessions, error } = await supabase
@@ -173,22 +190,18 @@ export async function autoClockOutAtEod(supabase: Sb) {
 
   if (error) throw new Error(error.message);
   if (!openSessions?.length) {
-    return { closed: 0, punchRequests: 0 };
+    return { closed: 0, punchRequests: 0, open: 0 };
   }
 
   let closed = 0;
-  let punchRequests = 0;
 
   for (const session of openSessions) {
-    const punch = await ensureForgotClockOutPunchRequest(supabase, session);
-    if (punch.created) punchRequests += 1;
-
     const outAt = suggestedClockOutIso(session.clock_in);
     const { error: updateError } = await supabase
       .from("clock_sessions")
       .update({
         clock_out: outAt,
-        notes: "Automatic clock-out at end of day (UK). Pending super admin punch approval.",
+        notes: "Automatic clock-out at end of day (UK).",
       })
       .eq("id", session.id)
       .is("clock_out", null);
@@ -196,5 +209,5 @@ export async function autoClockOutAtEod(supabase: Sb) {
     if (!updateError) closed += 1;
   }
 
-  return { closed, punchRequests, open: openSessions.length };
+  return { closed, punchRequests: 0, open: openSessions.length };
 }

@@ -55,7 +55,7 @@ router.get("/", async (req, res) => {
   let query = supabase
     .from("leave_requests")
     .select(
-      "id, requested_by, start_date, end_date, reason, status, reviewed_by, reviewed_at, created_at",
+      "id, requested_by, start_date, end_date, reason, leave_type, working_days, status, reviewed_by, reviewed_at, created_at",
     )
     .order("created_at", { ascending: false });
 

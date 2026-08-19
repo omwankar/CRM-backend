@@ -97,8 +97,14 @@ router.get("/team", async (req, res) => {
     daysByUser[s.user_id].add(s.clock_in.slice(0, 10));
   }
 
+  const { data: allPendingLeaves } = await supabase
+    .from("leave_requests")
+    .select("*")
+    .eq("status", "pending")
+    .order("created_at", { ascending: false });
+
   const leaves = leavesRes.data || [];
-  const pendingLeaves = leaves.filter((l) => l.status === "pending");
+  const pendingLeaves = allPendingLeaves || [];
 
   const rows = (users || []).map((u) => {
     const userLeaves = leaves.filter((l) => l.requested_by === u.id);

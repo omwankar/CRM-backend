@@ -33,6 +33,12 @@ function cacheSet(token: string, user: AuthUser) {
   authCache.set(token, { user, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
 }
 
+export function invalidateAuthCacheForUser(userId: string) {
+  for (const [token, hit] of authCache) {
+    if (hit.user.id === userId) authCache.delete(token);
+  }
+}
+
 // Extend Express Request type
 declare global {
   namespace Express {

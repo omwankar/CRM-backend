@@ -7,9 +7,7 @@ import { computeWorkingDays, getHolidayDatesInRange, getLeaveUsage } from '../li
 import { computeEmployeeMonthAttendance } from '../lib/attendanceCompute.js';
 import { computeAttendanceGrid } from '../lib/attendanceGrid.js';
 import {
-  FORGOT_CLOCK_OUT_LOCK_MESSAGE,
-  ensureForgotClockOutPunchRequest,
-  hasPendingAutomaticClockOutRequest,
+  closeStaleOpenSession,
   isStaleOpenSession,
 } from '../lib/clockForgotOut.js';
 
@@ -46,6 +44,24 @@ async function notifyLeave(userId: string, title: string, message: string) {
     title,
     message,
   });
+}
+
+async function notifyLeaveApprovers(excludeUserId: string, title: string, message: string) {
+  const { data: approvers } = await supabase
+    .from('users')
+    .select('id')
+    .in('role', ['super_admin', 'manager', 'admin'])
+    .eq('is_active', true);
+  const targets = (approvers || []).filter((a: { id: string }) => a.id !== excludeUserId);
+  if (!targets.length) return;
+  await supabase.from('notifications').insert(
+    targets.map((a: { id: string }) => ({
+      user_id: a.id,
+      type: 'leave',
+      title,
+      message,
+    })),
+  );
 }
 
 // GET /leave-requests — current user's leave requests
@@ -172,10 +188,23 @@ router.post('/leave-requests', async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
+  const range = `${parsed.data.start_date} to ${parsed.data.end_date}`;
   await notifyLeave(
     userId,
     'Leave request submitted',
-    `Your ${leaveType} leave from ${parsed.data.start_date} to ${parsed.data.end_date} (${workingDays} working day${workingDays === 1 ? '' : 's'}) is pending approval.`,
+    `Your ${leaveType} leave from ${range} (${workingDays} working day${workingDays === 1 ? '' : 's'}) is pending approval.`,
+  );
+
+  const { data: requester } = await supabase
+    .from('users')
+    .select('full_name, email')
+    .eq('id', userId)
+    .maybeSingle();
+  const who = requester?.full_name || requester?.email || 'An employee';
+  await notifyLeaveApprovers(
+    userId,
+    'Leave approval needed',
+    `${who} requested ${leaveType} leave (${range}, ${workingDays} working day${workingDays === 1 ? '' : 's'}). Open Leave Tracker to approve.`,
   );
 
   res.status(201).json(data);
@@ -228,14 +257,10 @@ router.post('/clock-in', async (req, res) => {
     .maybeSingle();
   if (openSession) {
     if (isStaleOpenSession(openSession.clock_in)) {
-      await ensureForgotClockOutPunchRequest(supabase, openSession);
-      return res.status(400).json({ error: FORGOT_CLOCK_OUT_LOCK_MESSAGE });
+      await closeStaleOpenSession(supabase, openSession);
+    } else {
+      return res.status(400).json({ error: 'You are already clocked in. Clock out first.' });
     }
-    return res.status(400).json({ error: 'You are already clocked in. Clock out first.' });
-  }
-
-  if (await hasPendingAutomaticClockOutRequest(supabase, userId)) {
-    return res.status(400).json({ error: FORGOT_CLOCK_OUT_LOCK_MESSAGE });
   }
 
   const { data, error } = await supabase
@@ -270,8 +295,10 @@ router.post('/clock-out', async (req, res) => {
   if (!openSession) return res.status(404).json({ error: 'No active session found' });
 
   if (isStaleOpenSession(openSession.clock_in)) {
-    await ensureForgotClockOutPunchRequest(supabase, openSession);
-    return res.status(400).json({ error: FORGOT_CLOCK_OUT_LOCK_MESSAGE });
+    await closeStaleOpenSession(supabase, openSession);
+    return res.status(400).json({
+      error: 'Yesterday’s session was closed automatically. Clock in again for today.',
+    });
   }
 
   const { data, error } = await supabase
@@ -321,6 +348,29 @@ router.post('/missed-punch-requests', async (req, res) => {
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
+
+  const { data: requester } = await supabase
+    .from('users')
+    .select('full_name, email')
+    .eq('id', userId)
+    .maybeSingle();
+  const who = requester?.full_name || requester?.email || 'An employee';
+  const { data: heads } = await supabase
+    .from('users')
+    .select('id')
+    .in('role', ['super_admin', 'admin'])
+    .eq('is_active', true);
+  if (heads?.length) {
+    await supabase.from('notifications').insert(
+      heads.map((h: { id: string }) => ({
+        user_id: h.id,
+        type: 'punch_request',
+        title: 'Punch request',
+        message: `${who} submitted a ${parsed.data.type === 'clock_in' ? 'clock-in' : 'clock-out'} punch request.`,
+      })),
+    );
+  }
+
   res.status(201).json(data);
 });
 

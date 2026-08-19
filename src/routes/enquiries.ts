@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
 import { creditWarningIfExceeded } from '../utils/buyerCredit.js';
+import { notifySuperAdmins } from '../lib/notifyAdmins.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -223,7 +224,7 @@ router.put('/:id', async (req, res) => {
 
   const { data: existing } = await supabase
     .from('enquiries')
-    .select('id, created_by, owner_id, enquiry_number')
+    .select('id, created_by, owner_id, enquiry_number, stage')
     .eq('id', req.params.id)
     .maybeSingle();
 
@@ -245,6 +246,16 @@ router.put('/:id', async (req, res) => {
   if (error || !data) return res.status(500).json({ error: error?.message || 'Update failed' });
 
   await logActivity(userId, `updated enquiry ${existing.enquiry_number}`, data.id);
+  const actor = req.user?.full_name || req.user?.email || 'Someone';
+  const stageNote =
+    parsed.data.stage && parsed.data.stage !== (existing as any).stage
+      ? ` Stage is now ${parsed.data.stage}.`
+      : '';
+  await notifySuperAdmins(
+    'enquiry',
+    parsed.data.stage ? 'Enquiry status changed' : 'Enquiry updated',
+    `${actor} updated enquiry ${existing.enquiry_number}.${stageNote}`,
+  );
   res.json(data);
 });
 

@@ -1,7 +1,7 @@
 import express from 'express';
 import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, invalidateAuthCacheForUser } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
 import { generateNextEmployeeId, isValidEmployeeId } from '../utils/employeeId.js';
 
@@ -20,9 +20,8 @@ function requireSuperAdmin(req: express.Request, res: express.Response): boolean
   return true;
 }
 
-// Role values that an admin can ASSIGN via the UI. Note `super_admin` is
-// intentionally absent - it can only be granted directly in the database.
-const assignableRole = z.enum(['manager', 'user']);
+// Roles a super_admin can assign from the UI.
+const assignableRole = z.enum(['super_admin', 'manager', 'user']);
 
 const inviteSchema = z.object({
   email: z.string().email(),
@@ -283,8 +282,24 @@ router.put('/:id', async (req, res) => {
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
 
+  if (parsed.data.role && parsed.data.role !== 'super_admin') {
+    const { data: existing } = await supabase.from('users').select('role').eq('id', req.params.id).maybeSingle();
+    if (existing?.role === 'super_admin') {
+      const { count } = await supabase
+        .from('users')
+        .select('id', { count: 'exact', head: true })
+        .eq('role', 'super_admin')
+        .eq('is_active', true);
+      if ((count || 0) <= 1) {
+        return res.status(400).json({ error: 'Cannot remove the last super admin' });
+      }
+    }
+  }
+
   const { data, error } = await supabase.from('users').update(parsed.data).eq('id', req.params.id).select().single();
   if (error || !data) return res.status(404).json({ error: 'Not found' });
+
+  invalidateAuthCacheForUser(req.params.id);
 
   // If role changed, update auth metadata
   if (parsed.data.role) {
