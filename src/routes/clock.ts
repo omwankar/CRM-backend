@@ -492,6 +492,16 @@ router.put('/punch-requests/:id/approve', async (req, res) => {
         .update({ clock_out: outAt, notes: 'Approved punch request (forgot clock-out)' })
         .eq('id', openSession.id);
       sessionApplied = true;
+    } else {
+      const outMs = new Date(outAt).getTime();
+      const inAt = new Date(outMs - 8 * 60 * 60 * 1000).toISOString();
+      await supabase.from('clock_sessions').insert({
+        user_id: request.user_id,
+        clock_in: inAt,
+        clock_out: outAt,
+        notes: 'Approved punch request (forgot clock-out)',
+      });
+      sessionApplied = true;
     }
   }
 

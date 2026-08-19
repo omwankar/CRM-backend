@@ -110,6 +110,9 @@ router.get('/', async (req, res) => {
   if (entity_type) query = query.eq('entity_type', String(entity_type));
   if (entity_id) query = query.eq('entity_id', String(entity_id));
   if (type && type !== 'all') query = query.eq('type', String(type));
+  if (req.user?.role === 'user' && req.user.id && !entity_id) {
+    query = query.eq('created_by', req.user.id);
+  }
 
   query = query.order('activity_date', { ascending: false }).range((p - 1) * l, p * l - 1);
 
@@ -120,6 +123,9 @@ router.get('/', async (req, res) => {
     if (entity_type) fb = fb.eq('entity_type', String(entity_type));
     if (entity_id) fb = fb.eq('entity_id', String(entity_id));
     if (type && type !== 'all') fb = fb.eq('type', String(type));
+    if (req.user?.role === 'user' && req.user.id && !entity_id) {
+      fb = fb.eq('created_by', req.user.id);
+    }
     fb = fb.order('activity_date', { ascending: false }).range((p - 1) * l, p * l - 1);
     const r = await fb;
     if (r.error) return res.status(500).json({ error: r.error.message });

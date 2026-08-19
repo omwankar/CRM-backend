@@ -68,8 +68,29 @@ router.put('/:id', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
   const userId = req.user?.id;
-  const userRole = req.user?.role;
-  const { data, error } = await supabase.from('comments').update({ deleted_at: new Date().toISOString() }).eq('id', req.params.id).is('deleted_at', null).select().single();
+  const role = req.user?.role;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { data: existing } = await supabase
+    .from('comments')
+    .select('id, author_id')
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (!existing) return res.status(404).json({ error: 'Not found' });
+
+  const canManage = role === 'manager' || role === 'super_admin' || role === 'admin';
+  if (!canManage && existing.author_id !== userId) {
+    return res.status(403).json({ error: 'You can only delete your own comments' });
+  }
+
+  const { data, error } = await supabase
+    .from('comments')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('id', req.params.id)
+    .is('deleted_at', null)
+    .select()
+    .single();
   if (error || !data) return res.status(404).json({ error: 'Not found' });
   res.json({ success: true });
 });

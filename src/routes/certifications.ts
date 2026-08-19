@@ -18,9 +18,11 @@ const schema = z.object({
   issue_date: z.string(),
   expiry_date: z.string(),
   certificate_number: z.string().optional(),
+  credential_id: z.string().optional(),
   status: z.enum(['active', 'expired', 'pending_renewal']).default('active'),
   document_url: z.string().optional(),
-  user_id: z.string().uuid(),
+  certificate_file: z.string().optional(),
+  user_id: z.string().uuid().optional(),
 });
 
 const updateSchema = schema.partial();
@@ -50,10 +52,25 @@ router.get('/:id', async (req, res) => {
 });
 
 // POST /
+function certPayload(data: z.infer<typeof schema> | z.infer<typeof updateSchema>, userId?: string) {
+  const { credential_id, certificate_file, ...rest } = data as z.infer<typeof schema> & {
+    credential_id?: string;
+    certificate_file?: string;
+  };
+  return {
+    ...rest,
+    certificate_number: rest.certificate_number || credential_id || undefined,
+    document_url: rest.document_url || certificate_file || undefined,
+    user_id: rest.user_id || userId || undefined,
+  };
+}
+
 router.post('/', async (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
-  const { data, error } = await supabase.from('certifications').insert(parsed.data).select().single();
+  const payload = certPayload(parsed.data, req.user?.id);
+  if (!payload.user_id) return res.status(400).json({ error: 'Could not determine owner for this certification.' });
+  const { data, error } = await supabase.from('certifications').insert(payload).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(data);
 });
@@ -62,7 +79,8 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.issues });
-  const { data, error } = await supabase.from('certifications').update(parsed.data).eq('id', req.params.id).is('deleted_at', null).select().single();
+  const payload = certPayload(parsed.data);
+  const { data, error } = await supabase.from('certifications').update(payload).eq('id', req.params.id).is('deleted_at', null).select().single();
   if (error || !data) return res.status(404).json({ error: 'Not found' });
   res.json(data);
 });

@@ -9,7 +9,7 @@ export async function notifySuperAdmins(type: string, title: string, message: st
     .eq('role', 'super_admin')
     .eq('is_active', true);
   if (!admins?.length) return;
-  await supabase.from('notifications').insert(
+  const { error } = await supabase.from('notifications').insert(
     admins.map((a: { id: string }) => ({
       user_id: a.id,
       type,
@@ -17,4 +17,5 @@ export async function notifySuperAdmins(type: string, title: string, message: st
       message,
     })),
   );
+  if (error) console.error('[notifySuperAdmins]', error.message);
 }

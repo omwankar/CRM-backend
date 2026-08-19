@@ -42,6 +42,21 @@ router.get('/unread-count', async (req, res) => {
   res.json({ count: count || 0 });
 });
 
+// POST /api/notifications/read-all — must be registered before /:id/read
+router.post('/read-all', async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { error } = await supabase
+    .from('notifications')
+    .update({ is_read: true })
+    .eq('user_id', userId)
+    .eq('is_read', false);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // POST /api/notifications/:id/read
 router.post('/:id/read', async (req, res) => {
   const userId = req.user?.id;
@@ -52,21 +67,6 @@ router.post('/:id/read', async (req, res) => {
     .update({ is_read: true })
     .eq('id', req.params.id)
     .eq('user_id', userId);
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
-});
-
-// POST /api/notifications/read-all
-router.post('/read-all', async (req, res) => {
-  const userId = req.user?.id;
-  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-
-  const { error } = await supabase
-    .from('notifications')
-    .update({ is_read: true })
-    .eq('user_id', userId)
-    .eq('is_read', false);
 
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });

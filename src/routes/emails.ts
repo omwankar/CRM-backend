@@ -322,6 +322,132 @@ router.post("/purge", requireSuperAdmin, async (_req, res) => {
   });
 });
 
+// GET /api/emails/contacts-extract — must be before /:id
+router.get("/contacts-extract", requireRole("manager", "super_admin"), async (req, res) => {
+  const scopedMailbox = isSuperAdmin(req) ? null : callerMailboxEmail(req);
+  const PAGE = 1000;
+  let columns = "sender_name, sender_email, sig_phone, sig_company";
+  let data: Array<Record<string, unknown>> = [];
+
+  for (let from = 0; ; from += PAGE) {
+    let query = supabase
+      .from("company_emails")
+      .select(columns)
+      .not("sender_email", "is", null)
+      .neq("sender_email", "")
+      .eq("direction", "inbound")
+      .range(from, from + PAGE - 1);
+
+    if (scopedMailbox) {
+      query = query.ilike("mailbox_email", scopedMailbox);
+    }
+
+    const { data: page, error } = await query;
+    if (error) {
+      const msg = String(error.message || "");
+      if (from === 0 && /sig_phone|sig_company|column/i.test(msg) && columns.includes("sig_phone")) {
+        columns = "sender_name, sender_email";
+        from = -PAGE;
+        continue;
+      }
+      return res.status(500).json({ error: msg });
+    }
+
+    data = data.concat((page || []) as unknown as Array<Record<string, unknown>>);
+    if (!page || page.length < PAGE) break;
+  }
+
+  const map = new Map<
+    string,
+    { name: string | null; email: string; phone: string | null; company: string | null; count: number }
+  >();
+
+  for (const row of data) {
+    const email = String(row.sender_email || "");
+    if (!email) continue;
+    const key = email.toLowerCase();
+    const name = row.sender_name ? String(row.sender_name) : null;
+    const phone = row.sig_phone ? String(row.sig_phone) : null;
+    const company =
+      (row.sig_company ? String(row.sig_company) : null) ||
+      guessCompanyFromSender(name, email);
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, { name, email, phone, company, count: 1 });
+    } else {
+      existing.count += 1;
+      if (!existing.phone && phone) existing.phone = phone;
+      if (!existing.company && company) existing.company = company;
+      if (!existing.name && name) existing.name = name;
+    }
+  }
+
+  const allEmails = [...map.keys()];
+  const existingContacts = new Set<string>();
+  for (let i = 0; i < allEmails.length; i += 500) {
+    const { data: contacts } = await supabase
+      .from("contacts")
+      .select("email")
+      .in("email", allEmails.slice(i, i + 500));
+    for (const c of contacts || []) {
+      if (c.email) existingContacts.add((c.email as string).toLowerCase());
+    }
+  }
+
+  const results = [...map.values()]
+    .map((r) => ({ ...r, already_contact: existingContacts.has(r.email.toLowerCase()) }))
+    .sort((a, b) => b.count - a.count);
+
+  res.json({ data: results, total: results.length });
+});
+
+router.post(
+  "/contacts-extract/import",
+  requireRole("manager", "super_admin"),
+  async (req, res) => {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const items = req.body?.contacts;
+    if (!Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: "contacts array is required" });
+    }
+
+    let imported = 0;
+    let skipped = 0;
+    const errors: string[] = [];
+
+    for (const item of items) {
+      const email = String(item.email || "").trim().toLowerCase();
+      if (!email) { skipped++; continue; }
+
+      const { data: existing } = await supabase
+        .from("contacts")
+        .select("id")
+        .ilike("email", email)
+        .maybeSingle();
+
+      if (existing) { skipped++; continue; }
+
+      const { error } = await supabase.from("contacts").insert({
+        full_name: String(item.name || email).trim(),
+        email,
+        phone: item.phone ? String(item.phone).trim() : null,
+        company: item.company ? String(item.company).trim() : null,
+        created_by: userId,
+      });
+
+      if (error) {
+        errors.push(`${email}: ${error.message}`);
+      } else {
+        imported++;
+      }
+    }
+
+    res.json({ imported, skipped, errors });
+  },
+);
+
 // GET /api/emails/:id — full detail
 router.get("/:id", async (req, res) => {
   const { data: email, error } = await supabase
@@ -446,142 +572,6 @@ router.patch("/:id/link", requireRole("manager", "super_admin"), async (req, res
   if (!data) return res.status(404).json({ error: "Email not found" });
   res.json(data);
 });
-
-// GET /api/emails/contacts-extract
-// Returns unique senders enriched with phone/company parsed from signatures
-router.get("/contacts-extract", requireRole("manager", "super_admin"), async (req, res) => {
-  const scopedMailbox = isSuperAdmin(req) ? null : callerMailboxEmail(req);
-
-  // Page through all rows (Supabase caps a single select at 1000).
-  // Fall back to base columns if sig_phone/sig_company don't exist yet (migration not run).
-  const PAGE = 1000;
-  let columns = "sender_name, sender_email, sig_phone, sig_company";
-  let data: Array<Record<string, unknown>> = [];
-
-  for (let from = 0; ; from += PAGE) {
-    let query = supabase
-      .from("company_emails")
-      .select(columns)
-      .not("sender_email", "is", null)
-      .neq("sender_email", "")
-      .eq("direction", "inbound")
-      .range(from, from + PAGE - 1);
-
-    if (scopedMailbox) {
-      query = query.ilike("mailbox_email", scopedMailbox);
-    }
-
-    const { data: page, error } = await query;
-    if (error) {
-      const msg = String(error.message || "");
-      if (from === 0 && /sig_phone|sig_company|column/i.test(msg) && columns.includes("sig_phone")) {
-        // Signature columns missing — retry without them
-        columns = "sender_name, sender_email";
-        from = -PAGE; // loop increment brings this back to 0
-        continue;
-      }
-      return res.status(500).json({ error: msg });
-    }
-
-    data = data.concat((page || []) as unknown as Array<Record<string, unknown>>);
-    if (!page || page.length < PAGE) break;
-  }
-
-  // Deduplicate by lower-cased email, merging best available phone/company per sender
-  const map = new Map<
-    string,
-    { name: string | null; email: string; phone: string | null; company: string | null; count: number }
-  >();
-
-  for (const row of data) {
-    const email = String(row.sender_email || "");
-    if (!email) continue;
-    const key = email.toLowerCase();
-    const name = row.sender_name ? String(row.sender_name) : null;
-    const phone = row.sig_phone ? String(row.sig_phone) : null;
-    const company =
-      (row.sig_company ? String(row.sig_company) : null) ||
-      guessCompanyFromSender(name, email);
-    const existing = map.get(key);
-    if (!existing) {
-      map.set(key, { name, email, phone, company, count: 1 });
-    } else {
-      existing.count += 1;
-      if (!existing.phone && phone) existing.phone = phone;
-      if (!existing.company && company) existing.company = company;
-      if (!existing.name && name) existing.name = name;
-    }
-  }
-
-  // Check which emails already exist as contacts (chunked — the list can be large)
-  const allEmails = [...map.keys()];
-  const existingContacts = new Set<string>();
-  for (let i = 0; i < allEmails.length; i += 500) {
-    const { data: contacts } = await supabase
-      .from("contacts")
-      .select("email")
-      .in("email", allEmails.slice(i, i + 500));
-    for (const c of contacts || []) {
-      if (c.email) existingContacts.add((c.email as string).toLowerCase());
-    }
-  }
-
-  const results = [...map.values()]
-    .map((r) => ({ ...r, already_contact: existingContacts.has(r.email.toLowerCase()) }))
-    .sort((a, b) => b.count - a.count);
-
-  res.json({ data: results, total: results.length });
-});
-
-// POST /api/emails/contacts-extract/import
-// Bulk-import selected email senders as contacts
-router.post(
-  "/contacts-extract/import",
-  requireRole("manager", "super_admin"),
-  async (req, res) => {
-    const userId = req.user?.id;
-    if (!userId) return res.status(401).json({ error: "Unauthorized" });
-
-    const items = req.body?.contacts;
-    if (!Array.isArray(items) || !items.length) {
-      return res.status(400).json({ error: "contacts array is required" });
-    }
-
-    let imported = 0;
-    let skipped = 0;
-    const errors: string[] = [];
-
-    for (const item of items) {
-      const email = String(item.email || "").trim().toLowerCase();
-      if (!email) { skipped++; continue; }
-
-      // Skip if already a contact
-      const { data: existing } = await supabase
-        .from("contacts")
-        .select("id")
-        .ilike("email", email)
-        .maybeSingle();
-
-      if (existing) { skipped++; continue; }
-
-      const { error } = await supabase.from("contacts").insert({
-        full_name: String(item.name || email).trim(),
-        email,
-        phone: item.phone ? String(item.phone).trim() : null,
-        company: item.company ? String(item.company).trim() : null,
-        created_by: userId,
-      });
-
-      if (error) {
-        errors.push(`${email}: ${error.message}`);
-      } else {
-        imported++;
-      }
-    }
-
-    res.json({ imported, skipped, errors });
-  },
-);
 
 export function registerEmailRoutes(api: express.Router) {
   api.use("/emails", router);

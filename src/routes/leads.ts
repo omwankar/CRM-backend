@@ -174,6 +174,18 @@ router.get('/stats', async (req, res) => {
 
 // GET /api/leads/:id/assignments — reassignment history
 router.get('/:id/assignments', async (req, res) => {
+  const { data: lead } = await supabase
+    .from('leads')
+    .select('id, created_by, assigned_to')
+    .eq('id', req.params.id)
+    .maybeSingle();
+  if (!lead) return res.status(404).json({ error: 'Lead not found' });
+  const role = req.user?.role;
+  const userId = req.user?.id;
+  if (!isPrivileged(role) && userId && lead.created_by !== userId && lead.assigned_to !== userId) {
+    return res.status(403).json({ error: 'You do not have access to this lead' });
+  }
+
   const { data, error } = await supabase
     .from('lead_assignments')
     .select(
@@ -365,8 +377,8 @@ router.post('/:id/convert', async (req, res) => {
     .single();
 
   if (oppErr) {
-    // Buyer already created — surface opportunity error but keep convert useful
-    console.error('Opportunity create failed on lead convert:', oppErr.message);
+    await supabase.from('buyers').delete().eq('id', buyer.id);
+    return res.status(500).json({ error: 'Lead converted buyer was rolled back because the opportunity could not be created. Please try again.' });
   }
 
   const now = new Date().toISOString();

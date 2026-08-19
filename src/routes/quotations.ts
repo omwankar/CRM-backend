@@ -368,6 +368,25 @@ router.get('/:id', async (req, res) => {
   if (qErr) return res.status(500).json({ error: qErr.message });
   if (!quotation) return res.status(404).json({ error: 'Not found' });
 
+  const role = req.user?.role;
+  const userId = req.user?.id;
+  if (role === 'user' && userId) {
+    const owns =
+      quotation.created_by === userId ||
+      quotation.enquiry_lead === userId;
+    if (!owns && quotation.project_id) {
+      const { data: member } = await supabase
+        .from('project_employees')
+        .select('project_id')
+        .eq('project_id', quotation.project_id)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (!member) return res.status(403).json({ error: 'You do not have access to this quotation' });
+    } else if (!owns) {
+      return res.status(403).json({ error: 'You do not have access to this quotation' });
+    }
+  }
+
   const [vendorQuotes, revisions, leadUser, project, updatedByUser, linkedInvoices, buyerRow, enquiryRow] =
     await Promise.all([
     supabase

@@ -863,7 +863,21 @@ async function syncMailbox(
       .from("company_emails")
       .upsert(row, { onConflict: "mailbox_id,graph_message_id", ignoreDuplicates: false });
 
-    if (!error) upserted += 1;
+    if (error && /sig_phone|sig_company|column/i.test(error.message || "")) {
+      const { sig_phone: _p, sig_company: _c, ...rest } = row;
+      const retry = await supabase()
+        .from("company_emails")
+        .upsert(rest, { onConflict: "mailbox_id,graph_message_id", ignoreDuplicates: false });
+      if (retry.error) {
+        console.error("[email-sync] upsert failed", retry.error.message);
+      } else {
+        upserted += 1;
+      }
+    } else if (error) {
+      console.error("[email-sync] upsert failed", error.message);
+    } else {
+      upserted += 1;
+    }
   }
 
   await supabase()

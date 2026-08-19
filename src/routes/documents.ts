@@ -21,6 +21,7 @@ const schema = z.object({
   record_id: z.string().uuid().nullable().optional(),
   file_name: z.string().min(1).optional(),
   document_type: z.enum(['contract', 'agreement', 'certificate', 'policy', 'other']).optional(),
+  expiry_date: z.string().nullable().optional(),
   file_url: z.string().min(1),
   file_path: z.string().optional(),
   file_size: z.number().optional(),
@@ -32,7 +33,7 @@ const updateSchema = schema.partial();
 
 router.get('/', async (req, res) => {
   const { related_table, related_id, document_type, module, record_id, page = '1', limit = '20' } = req.query;
-  let query = supabase.from('documents').select('*', { count: 'exact' });
+  let query = supabase.from('documents').select('*', { count: 'exact' }).is('deleted_at', null);
   if (related_table) query = query.eq('related_table', related_table);
   if (related_id) query = query.eq('related_id', related_id);
   if (module) query = query.eq('module', module);
@@ -46,7 +47,7 @@ router.get('/', async (req, res) => {
 });
 
 router.get('/:id', async (req, res) => {
-  const { data, error } = await supabase.from('documents').select('*').eq('id', req.params.id).maybeSingle();
+  const { data, error } = await supabase.from('documents').select('*').eq('id', req.params.id).is('deleted_at', null).maybeSingle();
   if (error || !data) return res.status(404).json({ error: 'Not found' });
   res.json(data);
 });
@@ -108,8 +109,16 @@ router.put('/:id', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
-  const { data, error } = await supabase.from('documents').delete().eq('id', req.params.id).select().single();
-  if (error || !data) return res.status(404).json({ error: 'Not found' });
+  const { data, error } = await supabase
+    .from('documents')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+  if (error || !data) {
+    const hard = await supabase.from('documents').delete().eq('id', req.params.id).select().single();
+    if (hard.error || !hard.data) return res.status(404).json({ error: 'Not found' });
+  }
   res.json({ success: true });
 });
 
