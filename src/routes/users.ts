@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import { authMiddleware, invalidateAuthCacheForUser } from '../middleware/auth.js';
 import { auditLog } from '../middleware/auditLog.js';
 import { generateNextEmployeeId, isValidEmployeeId } from '../utils/employeeId.js';
+import { normalizeAppRole } from '../lib/roles.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -87,7 +88,8 @@ router.get('/', async (req, res) => {
     query = query.range((p - 1) * l, p * l - 1).order('full_name', { ascending: true });
     const { data, count, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
-    return res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
+    const rows = (data || []).map((u) => ({ ...u, role: normalizeAppRole(u.role) }));
+    return res.json({ data: rows, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
   }
 
   let query = supabase.from('users').select('id, email, full_name, role, department, phone, is_active, last_login, invited_by, invited_at, avatar_url, created_at', { count: 'exact' });
@@ -97,7 +99,8 @@ router.get('/', async (req, res) => {
   query = query.range((p - 1) * l, p * l - 1).order('created_at', { ascending: false });
   const { data, count, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
+  const rows = (data || []).map((u) => ({ ...u, role: normalizeAppRole(u.role) }));
+  res.json({ data: rows, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
 });
 
 // GET /me — current user profile
@@ -107,7 +110,12 @@ router.get('/me', async (req, res) => {
 
   const { data, error } = await supabase.from('users').select('*').eq('id', userId).maybeSingle();
   if (error || !data) return res.status(404).json({ error: 'Not found', details: error?.message });
-  res.json(data);
+  const role = normalizeAppRole(data.role);
+  if (data.role !== role) {
+    await supabase.from('users').update({ role }).eq('id', userId);
+    invalidateAuthCacheForUser(userId);
+  }
+  res.json({ ...data, role });
 });
 
 /**
@@ -261,7 +269,7 @@ router.get('/:id', async (req, res) => {
 
   const { data, error } = await supabase.from('users').select('*').eq('id', req.params.id).maybeSingle();
   if (error || !data) return res.status(404).json({ error: 'Not found' });
-  res.json(data);
+  res.json({ ...data, role: normalizeAppRole(data.role) });
 });
 
 // PUT /:id — update user (super_admin only for role changes)

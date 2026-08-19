@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import type { RequestHandler } from 'express';
+import { normalizeAppRole } from '../lib/roles.js';
 
 const supabaseUrl = process.env.SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -97,9 +98,7 @@ export const authMiddleware: RequestHandler = async (req, res, next) => {
       return;
     }
 
-    const rawRole = userData.role || 'user';
-    // Legacy rows may still use `admin`; treat as manager for write guards.
-    const role = rawRole === 'admin' ? 'manager' : rawRole;
+    const role = normalizeAppRole(userData.role);
 
     req.user = {
       id: user.id,
@@ -136,7 +135,7 @@ export const optionalAuth: RequestHandler = async (req, _res, next) => {
         req.user = {
           id: user.id,
           email: userData?.email || user.email || '',
-          role: userData?.role || 'user',
+          role: normalizeAppRole(userData?.role),
           full_name: userData?.full_name || null,
         };
       }

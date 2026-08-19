@@ -12,8 +12,9 @@
 
 import type { RequestHandler } from "express";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { normalizeAppRole, type AppRole } from "../lib/roles.js";
 
-export type Role = "super_admin" | "manager" | "user";
+export type Role = AppRole;
 
 let cachedClient: SupabaseClient | null = null;
 function db(): SupabaseClient {
@@ -34,12 +35,11 @@ function db(): SupabaseClient {
  */
 export function requireRole(...allowed: Role[]): RequestHandler {
   return (req, res, next) => {
-    const rawRole = req.user?.role;
-    const role = (rawRole === 'admin' ? 'manager' : rawRole) as Role | undefined;
-    if (!role) {
+    if (!req.user) {
       res.status(401).json({ error: "unauthorized" });
       return;
     }
+    const role = normalizeAppRole(req.user.role);
     if (!allowed.includes(role)) {
       res.status(403).json({
         error: "You do not have permission to do that.",
