@@ -90,38 +90,74 @@ async function updateDocumentWithFallback(id: string, payload: Record<string, un
   return { data: null, error: { message: 'Not found' } };
 }
 
-router.get('/', async (req, res) => {
+/** Live documents table may lack created_at; remember whatever order actually works. */
+let documentsListOrder: 'created_at' | 'id' | null = 'created_at';
+
+async function listDocuments(req: express.Request) {
   const { related_table, related_id, document_type, module, record_id, page = '1', limit = '20' } = req.query;
-  // Do not filter deleted_at — that column is missing on the live documents table.
-  let query = supabase.from('documents').select('*', { count: 'exact' });
-  if (related_table) query = query.eq('related_table', related_table);
-  if (related_id) query = query.eq('related_id', related_id);
-  if (module) query = query.eq('module', module);
-  if (record_id) query = query.eq('record_id', record_id);
-  if (document_type) query = query.eq('document_type', document_type);
-  const p = Math.max(1, Number(page)), l = Math.min(100, Number(limit));
-  query = query.range((p - 1) * l, p * l - 1).order('created_at', { ascending: false });
-  const { data, count, error } = await query;
-  if (error) {
-    if (missingColumn(error.message || '')) {
-      const fallback = await supabase
-        .from('documents')
-        .select('*', { count: 'exact' })
-        .range((p - 1) * l, p * l - 1)
-        .order('created_at', { ascending: false });
-      if (!fallback.error) {
-        return res.json({
-          data: fallback.data,
-          total: fallback.count,
-          page: p,
-          limit: l,
-          totalPages: Math.ceil((fallback.count || 0) / l),
-        });
-      }
+  const p = Math.max(1, Number(page));
+  const l = Math.min(100, Number(limit));
+  const from = (p - 1) * l;
+  const to = p * l - 1;
+
+  const filters: Array<[string, string]> = [];
+  if (related_table) filters.push(['related_table', String(related_table)]);
+  if (related_id) filters.push(['related_id', String(related_id)]);
+  if (module) filters.push(['module', String(module)]);
+  if (record_id) filters.push(['record_id', String(record_id)]);
+  if (document_type) filters.push(['document_type', String(document_type)]);
+
+  let orderCol: 'created_at' | 'id' | null = documentsListOrder;
+
+  for (let round = 0; round < 8; round++) {
+    let query = supabase.from('documents').select('*', { count: 'exact' });
+    for (const [col, val] of filters) query = query.eq(col, val);
+    query = query.range(from, to);
+    if (orderCol) query = query.order(orderCol, { ascending: false });
+
+    const { data, count, error } = await query;
+    if (!error) {
+      documentsListOrder = orderCol;
+      return { data: data || [], count: count || 0, page: p, limit: l };
     }
-    return res.status(500).json({ error: error.message });
+
+    const col = missingColumn(error.message || '');
+    if (!col) throw error;
+    if (col === 'created_at') {
+      orderCol = 'id';
+      continue;
+    }
+    if (col === 'id') {
+      orderCol = null;
+      continue;
+    }
+    const idx = filters.findIndex(([name]) => name === col);
+    if (idx >= 0) {
+      filters.splice(idx, 1);
+      continue;
+    }
+    throw error;
   }
-  res.json({ data, total: count, page: p, limit: l, totalPages: Math.ceil((count || 0) / l) });
+
+  const { data, count, error } = await supabase.from('documents').select('*', { count: 'exact' }).range(from, to);
+  if (error) throw error;
+  return { data: data || [], count: count || 0, page: p, limit: l };
+}
+
+router.get('/', async (req, res) => {
+  try {
+    const result = await listDocuments(req);
+    res.json({
+      data: result.data,
+      total: result.count,
+      page: result.page,
+      limit: result.limit,
+      totalPages: Math.ceil(result.count / result.limit) || 0,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Could not load documents.';
+    res.status(500).json({ error: message });
+  }
 });
 
 router.get('/:id', async (req, res) => {
