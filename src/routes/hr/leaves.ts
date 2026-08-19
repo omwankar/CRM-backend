@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../../middleware/auth.js";
 import { auditLog } from "../../middleware/auditLog.js";
-import { requireHrAccess, requireManager } from "../../middleware/requireRole.js";
+import { requireHrAccess, requireSuperAdmin } from "../../middleware/requireRole.js";
 
 const router = express.Router();
 const supabase = createClient(
@@ -175,7 +175,7 @@ router.post("/", async (req, res) => {
   res.status(201).json(data);
 });
 
-router.patch("/:id", requireManager, async (req, res) => {
+router.patch("/:id", requireSuperAdmin, async (req, res) => {
   const reviewerId = req.user?.id;
   if (!reviewerId) return res.status(401).json({ error: "Unauthorized" });
 

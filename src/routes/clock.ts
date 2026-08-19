@@ -10,6 +10,7 @@ import {
   closeStaleOpenSession,
   isStaleOpenSession,
 } from '../lib/clockForgotOut.js';
+import { notifySuperAdmins } from '../lib/notifyAdmins.js';
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -46,23 +47,6 @@ async function notifyLeave(userId: string, title: string, message: string) {
   });
 }
 
-async function notifyLeaveApprovers(excludeUserId: string, title: string, message: string) {
-  const { data: approvers } = await supabase
-    .from('users')
-    .select('id')
-    .in('role', ['super_admin', 'manager', 'admin'])
-    .eq('is_active', true);
-  const targets = (approvers || []).filter((a: { id: string }) => a.id !== excludeUserId);
-  if (!targets.length) return;
-  await supabase.from('notifications').insert(
-    targets.map((a: { id: string }) => ({
-      user_id: a.id,
-      type: 'leave',
-      title,
-      message,
-    })),
-  );
-}
 
 // GET /leave-requests — current user's leave requests
 router.get('/leave-requests', async (req, res) => {
@@ -201,8 +185,8 @@ router.post('/leave-requests', async (req, res) => {
     .eq('id', userId)
     .maybeSingle();
   const who = requester?.full_name || requester?.email || 'An employee';
-  await notifyLeaveApprovers(
-    userId,
+  await notifySuperAdmins(
+    'leave',
     'Leave approval needed',
     `${who} requested ${leaveType} leave (${range}, ${workingDays} working day${workingDays === 1 ? '' : 's'}). Open Leave Tracker to approve.`,
   );
@@ -355,21 +339,11 @@ router.post('/missed-punch-requests', async (req, res) => {
     .eq('id', userId)
     .maybeSingle();
   const who = requester?.full_name || requester?.email || 'An employee';
-  const { data: heads } = await supabase
-    .from('users')
-    .select('id')
-    .in('role', ['super_admin', 'admin'])
-    .eq('is_active', true);
-  if (heads?.length) {
-    await supabase.from('notifications').insert(
-      heads.map((h: { id: string }) => ({
-        user_id: h.id,
-        type: 'punch_request',
-        title: 'Punch request',
-        message: `${who} submitted a ${parsed.data.type === 'clock_in' ? 'clock-in' : 'clock-out'} punch request.`,
-      })),
-    );
-  }
+  await notifySuperAdmins(
+    'punch_request',
+    'Punch request',
+    `${who} submitted a ${parsed.data.type === 'clock_in' ? 'clock-in' : 'clock-out'} punch request. Open Punch Requests to approve.`,
+  );
 
   res.status(201).json(data);
 });
