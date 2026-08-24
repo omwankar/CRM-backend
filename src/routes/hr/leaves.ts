@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../../middleware/auth.js";
 import { auditLog } from "../../middleware/auditLog.js";
 import { requireHrAccess, requireSuperAdmin } from "../../middleware/requireRole.js";
+import { computeWorkingDays, getHolidayDatesInRange } from "../../lib/leave.js";
 
 const router = express.Router();
 const supabase = createClient(
@@ -27,9 +28,41 @@ const submitSchema = z.object({
   leave_type: z.enum(["paid", "unpaid", "lop"]).default("unpaid"),
 });
 
+const assignSchema = z.object({
+  user_id: z.string().uuid(),
+  start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  leave_type: z.enum(["paid", "lop"]),
+  reason: z.string().max(500).optional(),
+});
+
 const decisionSchema = z.object({
   status: z.enum(["approved", "rejected"]),
 });
+
+function missingColumn(message: string) {
+  const match =
+    String(message || "").match(/Could not find the '([^']+)' column/i) ||
+    String(message || "").match(/column (?:[\w.]+\.)?([a-zA-Z0-9_]+) does not exist/i);
+  return match?.[1] || null;
+}
+
+async function insertLeaveWithFallback(payload: Record<string, unknown>) {
+  let attempt: Record<string, unknown> = { ...payload };
+  for (let i = 0; i < 10; i++) {
+    const { data, error } = await supabase.from("leave_requests").insert(attempt).select().single();
+    if (!error) return { data, error: null as null };
+
+    const col = missingColumn(error.message || "");
+    if (col && col in attempt) {
+      const { [col]: _removed, ...rest } = attempt;
+      attempt = rest;
+      continue;
+    }
+    return { data: null, error };
+  }
+  return { data: null, error: { message: "Could not save the leave. Please try again." } };
+}
 
 function isManagerRole(role?: string) {
   return role === "manager" || role === "super_admin" || role === "admin";
@@ -172,6 +205,97 @@ router.post("/", async (req, res) => {
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+/** Super Admin assigns paid leave or LOP to an employee (approved immediately). */
+router.post("/assign", requireSuperAdmin, async (req, res) => {
+  const reviewerId = req.user?.id;
+  if (!reviewerId) return res.status(401).json({ error: "Unauthorized" });
+
+  const parsed = assignSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validation failed", issues: parsed.error.issues });
+  }
+
+  const { user_id, start_date, end_date, leave_type } = parsed.data;
+  if (end_date < start_date) {
+    return res.status(400).json({ error: "End date must be on or after start date" });
+  }
+
+  const { data: employee } = await supabase
+    .from("users")
+    .select("id, full_name, email, employee_id, is_active")
+    .eq("id", user_id)
+    .maybeSingle();
+
+  if (!employee) return res.status(404).json({ error: "Employee not found" });
+  if (employee.is_active === false) {
+    return res.status(400).json({ error: "That employee is inactive" });
+  }
+
+  const { data: overlapping, error: overlapErr } = await supabase
+    .from("leave_requests")
+    .select("id, start_date, end_date, status, leave_type")
+    .eq("requested_by", user_id)
+    .neq("status", "rejected")
+    .lte("start_date", end_date)
+    .gte("end_date", start_date);
+
+  if (overlapErr) return res.status(500).json({ error: "Could not check existing leave. Please try again." });
+  if (overlapping && overlapping.length > 0) {
+    const first = overlapping[0];
+    return res.status(409).json({
+      error: `This employee already has ${first.status} leave from ${first.start_date} to ${first.end_date}.`,
+    });
+  }
+
+  const holidayDates = await getHolidayDatesInRange(supabase, start_date, end_date);
+  const workingDays = computeWorkingDays(start_date, end_date, holidayDates);
+  if (workingDays < 1) {
+    return res.status(400).json({
+      error: "That range has no working days (weekends and holidays are skipped).",
+    });
+  }
+
+  const typeLabel = leave_type === "lop" ? "LOP (Loss of Pay)" : "paid leave";
+  const reason =
+    parsed.data.reason?.trim() || `Marked as ${typeLabel} by Super Admin`;
+
+  const { data, error } = await insertLeaveWithFallback({
+    requested_by: user_id,
+    employee_id: employee.employee_id || null,
+    start_date,
+    end_date,
+    reason,
+    leave_type,
+    working_days: workingDays,
+    status: "approved",
+    reviewed_by: reviewerId,
+    reviewed_at: new Date().toISOString(),
+  });
+
+  if (error || !data) {
+    const msg = String(error?.message || "").toLowerCase();
+    if (msg.includes("leave_type") || msg.includes("check constraint")) {
+      return res.status(400).json({
+        error: `Could not mark as ${typeLabel}. Paid leave and LOP must be allowed on leave requests.`,
+      });
+    }
+    return res.status(500).json({ error: "Could not mark leave. Please try again." });
+  }
+
+  const who = employee.full_name || employee.email || "Employee";
+  try {
+    await notifyUser(
+      user_id,
+      leave_type === "lop" ? "Marked as LOP" : "Marked as paid leave",
+      `${who}: ${typeLabel} from ${start_date} to ${end_date} (${workingDays} working day${workingDays === 1 ? "" : "s"}) has been applied by Super Admin.`,
+    );
+  } catch {
+    /* leave is already saved */
+  }
+
   res.status(201).json(data);
 });
 
