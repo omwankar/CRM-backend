@@ -31,6 +31,11 @@ export const TASK_PRIORITIES = ['low', 'medium', 'high'] as const;
 const SALES_TYPES = ['lead', 'opportunity', 'enquiry', 'quotation', 'buyer', 'contact', 'company'] as const;
 const OPS_TYPES = ['job', 'project', 'vendor'] as const;
 const FINANCE_TYPES = ['invoice'] as const;
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Remember which live-schema columns work so we don't retry every request. */
+let cachedTaskOrderCol: string | null = null;
+let cachedAssignedDateCol: string | null = null;
 
 const createSchema = z.object({
   title: z.string().trim().min(1).optional(),
@@ -221,6 +226,18 @@ function canEdit(task: any, userId?: string, role?: string) {
   );
 }
 
+function applyAssignedDateRange(query: any, from: string, to: string, col: string) {
+  if (!from && !to) return query;
+  if (col === 'created_at') {
+    if (from) query = query.gte('created_at', `${from}T00:00:00.000Z`);
+    if (to) query = query.lte('created_at', `${to}T23:59:59.999Z`);
+    return query;
+  }
+  if (from) query = query.gte(col, from);
+  if (to) query = query.lte(col, to);
+  return query;
+}
+
 // GET /api/tasks
 router.get('/', async (req, res) => {
   const {
@@ -232,6 +249,8 @@ router.get('/', async (req, res) => {
     entity_type,
     entity_id,
     assignee_id,
+    assigned_from,
+    assigned_to,
     page = '1',
     limit = '50',
   } = req.query;
@@ -247,48 +266,89 @@ router.get('/', async (req, res) => {
     return res.status(403).json({ error: 'Team view requires manager access' });
   }
 
-  let query = supabase.from('tasks').select('*', { count: 'exact' }).is('deleted_at', null);
+  if (view === 'entity' && (!entity_type || !entity_id)) {
+    return res.status(400).json({ error: 'entity_type and entity_id required for entity view' });
+  }
 
-  if (view === 'mine') {
-    query = query.or(
-      `assigned_person_id.eq.${userId},created_by.eq.${userId},supervisor_id.eq.${userId}`,
-    );
-  } else if (view === 'sales') {
-    query = query.or(`entity_type.is.null,entity_type.in.(${SALES_TYPES.join(',')})`);
-  } else if (view === 'operations') {
-    query = query.or(`entity_type.is.null,entity_type.in.(${OPS_TYPES.join(',')})`);
-  } else if (view === 'finance') {
-    query = query.or(`entity_type.is.null,entity_type.in.(${FINANCE_TYPES.join(',')})`);
-  } else if (view === 'team') {
-    // all tasks
-  } else if (view === 'entity') {
-    if (!entity_type || !entity_id) {
-      return res.status(400).json({ error: 'entity_type and entity_id required for entity view' });
+  const from = DATE_ONLY_RE.test(String(assigned_from || '')) ? String(assigned_from) : '';
+  const to = DATE_ONLY_RE.test(String(assigned_to || '')) ? String(assigned_to) : '';
+  const wantsDateFilter = Boolean(from || to);
+
+  const dateCols = wantsDateFilter
+    ? (cachedAssignedDateCol ? [cachedAssignedDateCol] : ['assigned_date', 'created_at'])
+    : [''];
+  const orderCols = cachedTaskOrderCol
+    ? [cachedTaskOrderCol]
+    : ['created_at', 'assigned_date', 'id'];
+
+  let data: any[] | null = null;
+  let count: number | null = null;
+  let error: { message: string } | null = null;
+
+  outer: for (const dateCol of dateCols) {
+    for (const orderCol of orderCols) {
+      let query = supabase.from('tasks').select('*', { count: 'exact' }).is('deleted_at', null);
+
+      if (view === 'mine') {
+        query = query.or(
+          `assigned_person_id.eq.${userId},created_by.eq.${userId},supervisor_id.eq.${userId}`,
+        );
+      } else if (view === 'sales') {
+        query = query.or(`entity_type.is.null,entity_type.in.(${SALES_TYPES.join(',')})`);
+      } else if (view === 'operations') {
+        query = query.or(`entity_type.is.null,entity_type.in.(${OPS_TYPES.join(',')})`);
+      } else if (view === 'finance') {
+        query = query.or(`entity_type.is.null,entity_type.in.(${FINANCE_TYPES.join(',')})`);
+      } else if (view === 'entity') {
+        query = query.eq('entity_type', String(entity_type)).eq('entity_id', String(entity_id));
+      }
+
+      if (status && status !== 'all') query = query.eq('status', String(status));
+      if (priority && priority !== 'all') query = query.eq('priority', String(priority));
+      if (assignee_id) query = query.eq('assigned_person_id', String(assignee_id));
+      if (entity_type && view !== 'entity') query = query.eq('entity_type', String(entity_type));
+      if (entity_id && view !== 'entity') query = query.eq('entity_id', String(entity_id));
+
+      if (search) {
+        const s = String(search).replace(/[%_,()]/g, ' ').trim();
+        if (s) query = query.or(`task_title.ilike.%${s}%,notes.ilike.%${s}%,task_id.ilike.%${s}%`);
+      }
+
+      if (overdue === '1' || overdue === 'true') {
+        const today = new Date().toISOString().slice(0, 10);
+        query = query.lt('due_date', today).not('status', 'in', '("completed","cancelled")');
+      }
+
+      if (wantsDateFilter && dateCol) {
+        query = applyAssignedDateRange(query, from, to, dateCol);
+      }
+
+      query = query.order(orderCol, { ascending: false }).range((p - 1) * l, p * l - 1);
+
+      const result = await query;
+      if (!result.error) {
+        if (wantsDateFilter && dateCol) cachedAssignedDateCol = dateCol;
+        cachedTaskOrderCol = orderCol;
+        data = result.data;
+        count = result.count;
+        error = null;
+        break outer;
+      }
+
+      error = result.error;
+      const missing = missingColumn(result.error.message || '');
+      if (wantsDateFilter && dateCol && missing === dateCol) {
+        cachedAssignedDateCol = null;
+        break;
+      }
+      if (missing === orderCol) {
+        cachedTaskOrderCol = null;
+        continue;
+      }
+      break outer;
     }
-    query = query.eq('entity_type', String(entity_type)).eq('entity_id', String(entity_id));
   }
 
-  if (status && status !== 'all') query = query.eq('status', String(status));
-  if (priority && priority !== 'all') query = query.eq('priority', String(priority));
-  if (assignee_id) query = query.eq('assigned_person_id', String(assignee_id));
-  if (entity_type && view !== 'entity') query = query.eq('entity_type', String(entity_type));
-  if (entity_id && view !== 'entity') query = query.eq('entity_id', String(entity_id));
-
-  if (search) {
-    const s = String(search).replace(/[%_,()]/g, ' ').trim();
-    if (s) query = query.or(`task_title.ilike.%${s}%,notes.ilike.%${s}%,task_id.ilike.%${s}%`);
-  }
-
-  if (overdue === '1' || overdue === 'true') {
-    const today = new Date().toISOString().slice(0, 10);
-    query = query
-      .lt('due_date', today)
-      .not('status', 'in', '("completed","cancelled")');
-  }
-
-  query = query.order('due_date', { ascending: true }).range((p - 1) * l, p * l - 1);
-
-  const { data, count, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
 
   const enriched = await enrichTasks(data || []);
