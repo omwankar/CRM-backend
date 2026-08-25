@@ -18,6 +18,13 @@ router.use(sharedWriteGuard);
 const emptyToNull = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? null : v);
 const emptyToUndefined = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? undefined : v);
 
+function missingColumn(message: string) {
+  const match =
+    String(message || '').match(/Could not find the '([^']+)' column/i) ||
+    String(message || '').match(/column (?:[\w.]+\.)?([a-zA-Z0-9_]+) does not exist/i);
+  return match?.[1] || null;
+}
+
 function friendlyProjectError(message: string): string {
   const m = String(message || '').toLowerCase();
   if (m.includes('schema cache') || m.includes("could not find the '")) {
@@ -122,39 +129,44 @@ router.get('/', async (req, res) => {
     const limitNum = parseInt(limit as string);
     const offset = (pageNum - 1) * limitNum;
 
-    let query = supabase
-      .from('projects')
-      .select('*', { count: 'exact' })
-      .is('deleted_at', null);
+    // Apply sorting — newest start date first by default.
+    const allowedSortColumns = ['start_date', 'created_at', 'estimated_end_date', 'project_name', 'id'];
+    const requestedSortBy = (sort_by as string) || 'start_date';
+    const sortBy = allowedSortColumns.includes(requestedSortBy) ? requestedSortBy : 'start_date';
+    const sortOrder = (sort_order as string) || 'desc';
+    const ascending = sortOrder === 'asc';
+    const orderFallbacks = [sortBy, 'start_date', 'created_at', 'id'].filter(
+      (col, i, arr) => arr.indexOf(col) === i,
+    );
 
-    // Apply filters
-    if (status) {
-      query = query.eq('status', status);
+    let data: any[] | null = null;
+    let count: number | null = null;
+    let error: { message: string } | null = null;
+
+    for (const orderCol of orderFallbacks) {
+      let query = supabase.from('projects').select('*', { count: 'exact' }).is('deleted_at', null);
+
+      if (status) query = query.eq('status', status);
+      if (search) query = query.or(`project_name.ilike.%${search}%,project_id.ilike.%${search}%`);
+      if (start_date) query = query.gte('start_date', start_date);
+      if (end_date) query = query.lte('estimated_end_date', end_date);
+
+      query = query
+        .order(orderCol, { ascending, nullsFirst: false })
+        .range(offset, offset + limitNum - 1);
+
+      const result = await query;
+      if (!result.error) {
+        data = result.data;
+        count = result.count;
+        error = null;
+        break;
+      }
+      error = result.error;
+      const missing = missingColumn(result.error.message || '');
+      if (missing === orderCol) continue;
+      break;
     }
-
-    if (search) {
-      query = query.or(`project_name.ilike.%${search}%,project_id.ilike.%${search}%`);
-    }
-
-    if (start_date) {
-      query = query.gte('start_date', start_date);
-    }
-
-    if (end_date) {
-      query = query.lte('estimated_end_date', end_date);
-    }
-
-    // Apply sorting
-    const allowedSortColumns = new Set(['created_at', 'start_date', 'estimated_end_date', 'project_name']);
-    const requestedSortBy = (sort_by as string) || 'created_at';
-    const sortBy = allowedSortColumns.has(requestedSortBy) ? requestedSortBy : 'created_at';
-    const sortOrder = sort_order as string || 'desc';
-    query = query.order(sortBy, { ascending: sortOrder === 'asc' });
-
-    // Apply pagination
-    query = query.range(offset, offset + limitNum - 1);
-
-    const { data, error, count } = await query;
 
     if (error) {
       return res.status(500).json({ error: error.message });
