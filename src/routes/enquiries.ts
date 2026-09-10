@@ -73,7 +73,7 @@ router.get('/', async (req, res) => {
   let query = supabase
     .from('enquiries')
     .select(
-      '*, owner:users!enquiries_owner_id_fkey(id, full_name), creator:users!enquiries_created_by_fkey(id, full_name), buyer:buyers!enquiries_buyer_id_fkey(id, buyer_name)',
+      '*, owner:users!enquiries_owner_id_fkey(id, full_name), creator:users!enquiries_created_by_fkey(id, full_name), updater:users!enquiries_updated_by_fkey(id, full_name), buyer:buyers!enquiries_buyer_id_fkey(id, buyer_name)',
       { count: 'exact' },
     );
 
