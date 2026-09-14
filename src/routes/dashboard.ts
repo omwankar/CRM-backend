@@ -140,39 +140,38 @@ router.get('/stats', async (req, res) => {
     }
 
     const [
-      leadsCountRes,
+      enquiriesCountRes,
       contactsCountRes,
       companiesCountRes,
       opportunitiesCountRes,
-      leadsThisMonthRes,
-      leadsLastMonthRes,
+      enquiriesThisMonthRes,
+      enquiriesLastMonthRes,
       contactsThisMonthRes,
       contactsLastMonthRes,
       companiesThisMonthRes,
       companiesLastMonthRes,
       oppsThisMonthRes,
       oppsLastMonthRes,
-      leadsAllRes,
-      recentLeadsRes,
+      enquiriesAllRes,
+      recentEnquiriesRes,
       followUpsRes,
     ] = await Promise.all([
-      supabase.from('leads').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('enquiries').select('id', { count: 'exact', head: true }),
       supabase.from('contacts').select('id', { count: 'exact', head: true }),
       supabase.from('companies').select('id', { count: 'exact', head: true }).is('deleted_at', null),
       supabase.from('opportunities').select('id', { count: 'exact', head: true }).is('deleted_at', null),
-      countSince('leads', monthStart, undefined, true),
-      countSince('leads', lastMonthStart, monthStart, true),
+      countSince('enquiries', monthStart),
+      countSince('enquiries', lastMonthStart, monthStart),
       countSince('contacts', monthStart),
       countSince('contacts', lastMonthStart, monthStart),
       countSince('companies', monthStart, undefined, true),
       countSince('companies', lastMonthStart, monthStart, true),
       countSince('opportunities', monthStart, undefined, true),
       countSince('opportunities', lastMonthStart, monthStart, true),
-      supabase.from('leads').select('status, source').is('deleted_at', null),
+      supabase.from('enquiries').select('stage, priority'),
       supabase
-        .from('leads')
-        .select('id, lead_name, company_name, status, source, created_at')
-        .is('deleted_at', null)
+        .from('enquiries')
+        .select('id, enquiry_number, title, requirement, stage, priority, prospect_name, client_email, created_at')
         .order('created_at', { ascending: false })
         .limit(6),
       followUpsQuery,
@@ -181,13 +180,13 @@ router.get('/stats', async (req, res) => {
     const pctChange = (thisM: number, lastM: number) =>
       lastM === 0 ? (thisM > 0 ? 100 : 0) : Math.round(((thisM - lastM) / lastM) * 100);
 
-    const leadsByStatus: Record<string, number> = {};
-    const leadsBySource: Record<string, number> = {};
-    for (const l of (leadsAllRes.error ? [] : leadsAllRes.data) || []) {
-      const st = l.status || 'new';
-      leadsByStatus[st] = (leadsByStatus[st] || 0) + 1;
-      const src = (l.source || 'other').toLowerCase();
-      leadsBySource[src] = (leadsBySource[src] || 0) + 1;
+    const enquiriesByStage: Record<string, number> = {};
+    const enquiriesByPriority: Record<string, number> = {};
+    for (const e of (enquiriesAllRes.error ? [] : enquiriesAllRes.data) || []) {
+      const st = e.stage || 'new_enquiry';
+      enquiriesByStage[st] = (enquiriesByStage[st] || 0) + 1;
+      const pr = (e.priority || 'medium').toLowerCase();
+      enquiriesByPriority[pr] = (enquiriesByPriority[pr] || 0) + 1;
     }
 
     const DAY_MS = 24 * 60 * 60 * 1000;
@@ -211,13 +210,13 @@ router.get('/stats', async (req, res) => {
     }
 
     const crm = {
-      leads: { total: countOrZero(leadsCountRes), change: pctChange(countOrZero(leadsThisMonthRes), countOrZero(leadsLastMonthRes)) },
+      enquiries: { total: countOrZero(enquiriesCountRes), change: pctChange(countOrZero(enquiriesThisMonthRes), countOrZero(enquiriesLastMonthRes)) },
       contacts: { total: countOrZero(contactsCountRes), change: pctChange(countOrZero(contactsThisMonthRes), countOrZero(contactsLastMonthRes)) },
       companies: { total: countOrZero(companiesCountRes), change: pctChange(countOrZero(companiesThisMonthRes), countOrZero(companiesLastMonthRes)) },
       opportunities: { total: countOrZero(opportunitiesCountRes), change: pctChange(countOrZero(oppsThisMonthRes), countOrZero(oppsLastMonthRes)) },
-      leadsByStatus,
-      leadsBySource,
-      recentLeads: recentLeadsRes.error ? [] : recentLeadsRes.data || [],
+      enquiriesByStage,
+      enquiriesByPriority,
+      recentEnquiries: recentEnquiriesRes.error ? [] : recentEnquiriesRes.data || [],
       followUps,
     };
 
