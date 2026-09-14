@@ -40,6 +40,7 @@ import { registerCompanyRoutes } from "./routes/companies.js";
 import { registerActivityRoutes } from "./routes/activities.js";
 import { registerContactRoutes } from "./routes/contacts.js";
 import { registerEmailRoutes, registerEmailSyncInternalRoute } from "./routes/emails.js";
+import { registerFollowUpRoutes } from "./routes/followups.js";
 import { startEmailSyncCron } from "./jobs/emailSyncCron.js";
 import { startTaskOverdueCron } from "./jobs/taskOverdueCron.js";
 import { startAnnouncementExpiryCron } from "./jobs/announcementExpiryCron.js";
@@ -118,6 +119,7 @@ registerCompanyRoutes(api);
 registerActivityRoutes(api);
 registerContactRoutes(api);
 registerEmailRoutes(api);
+registerFollowUpRoutes(api);
 registerEmailSyncInternalRoute(api);
 app.use("/api", api);
 

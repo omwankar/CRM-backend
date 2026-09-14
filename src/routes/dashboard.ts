@@ -120,6 +120,107 @@ router.get('/stats', async (req, res) => {
         .gte('end_date', today),
     ]);
 
+    // ---- CRM overview data (leads / contacts / companies / opportunities) ----
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+    const lastMonthStart = new Date(monthStart);
+    lastMonthStart.setMonth(lastMonthStart.getMonth() - 1);
+
+    const countSince = (table: string, from: Date, to?: Date, softDelete = false) => {
+      let q = supabase.from(table).select('id', { count: 'exact', head: true }).gte('created_at', from.toISOString());
+      if (to) q = q.lt('created_at', to.toISOString());
+      if (softDelete) q = q.is('deleted_at', null);
+      return q;
+    };
+
+    let followUpsQuery = supabase.from('follow_ups').select('id, due_at, status, completed_at, assigned_to, created_by, watchers');
+    if (!isSuperAdmin) {
+      followUpsQuery = followUpsQuery.or(`assigned_to.eq.${userId},created_by.eq.${userId},watchers.cs.{${userId}}`);
+    }
+
+    const [
+      leadsCountRes,
+      contactsCountRes,
+      companiesCountRes,
+      opportunitiesCountRes,
+      leadsThisMonthRes,
+      leadsLastMonthRes,
+      contactsThisMonthRes,
+      contactsLastMonthRes,
+      companiesThisMonthRes,
+      companiesLastMonthRes,
+      oppsThisMonthRes,
+      oppsLastMonthRes,
+      leadsAllRes,
+      recentLeadsRes,
+      followUpsRes,
+    ] = await Promise.all([
+      supabase.from('leads').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('contacts').select('id', { count: 'exact', head: true }),
+      supabase.from('companies').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('opportunities').select('id', { count: 'exact', head: true }).is('deleted_at', null),
+      countSince('leads', monthStart, undefined, true),
+      countSince('leads', lastMonthStart, monthStart, true),
+      countSince('contacts', monthStart),
+      countSince('contacts', lastMonthStart, monthStart),
+      countSince('companies', monthStart, undefined, true),
+      countSince('companies', lastMonthStart, monthStart, true),
+      countSince('opportunities', monthStart, undefined, true),
+      countSince('opportunities', lastMonthStart, monthStart, true),
+      supabase.from('leads').select('status, source').is('deleted_at', null),
+      supabase
+        .from('leads')
+        .select('id, lead_name, company_name, status, source, created_at')
+        .is('deleted_at', null)
+        .order('created_at', { ascending: false })
+        .limit(6),
+      followUpsQuery,
+    ]);
+
+    const pctChange = (thisM: number, lastM: number) =>
+      lastM === 0 ? (thisM > 0 ? 100 : 0) : Math.round(((thisM - lastM) / lastM) * 100);
+
+    const leadsByStatus: Record<string, number> = {};
+    const leadsBySource: Record<string, number> = {};
+    for (const l of (leadsAllRes.error ? [] : leadsAllRes.data) || []) {
+      const st = l.status || 'new';
+      leadsByStatus[st] = (leadsByStatus[st] || 0) + 1;
+      const src = (l.source || 'other').toLowerCase();
+      leadsBySource[src] = (leadsBySource[src] || 0) + 1;
+    }
+
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const nowMs = Date.now();
+    const startOfTodayFu = new Date();
+    startOfTodayFu.setHours(0, 0, 0, 0);
+    const endOfTodayMs = startOfTodayFu.getTime() + DAY_MS;
+    const soonEndMs = startOfTodayFu.getTime() + 4 * DAY_MS;
+    const followUps = { overdue: 0, due_today: 0, due_soon: 0, upcoming: 0, completed_this_month: 0 };
+    for (const f of (followUpsRes.error ? [] : followUpsRes.data) || []) {
+      if (f.status === 'completed') {
+        if (f.completed_at && new Date(f.completed_at).getTime() >= monthStart.getTime()) followUps.completed_this_month++;
+        continue;
+      }
+      if (f.status !== 'pending') continue;
+      const due = new Date(f.due_at).getTime();
+      if (due < nowMs) followUps.overdue++;
+      else if (due < endOfTodayMs) followUps.due_today++;
+      else if (due < soonEndMs) followUps.due_soon++;
+      else followUps.upcoming++;
+    }
+
+    const crm = {
+      leads: { total: countOrZero(leadsCountRes), change: pctChange(countOrZero(leadsThisMonthRes), countOrZero(leadsLastMonthRes)) },
+      contacts: { total: countOrZero(contactsCountRes), change: pctChange(countOrZero(contactsThisMonthRes), countOrZero(contactsLastMonthRes)) },
+      companies: { total: countOrZero(companiesCountRes), change: pctChange(countOrZero(companiesThisMonthRes), countOrZero(companiesLastMonthRes)) },
+      opportunities: { total: countOrZero(opportunitiesCountRes), change: pctChange(countOrZero(oppsThisMonthRes), countOrZero(oppsLastMonthRes)) },
+      leadsByStatus,
+      leadsBySource,
+      recentLeads: recentLeadsRes.error ? [] : recentLeadsRes.data || [],
+      followUps,
+    };
+
     const todaySessions = todaySessionsRes.data;
     const pipelineData = pipelineRes.data;
     const recentActivity = recentActivityRes.data;
@@ -208,6 +309,7 @@ router.get('/stats', async (req, res) => {
         alerts: countOrZero(alertsRes),
         hoursToday: Math.round(hoursToday * 100) / 100,
       },
+      crm,
       pipelineOverview,
       recentActivity: recentActivity || [],
       upcomingEvents: upcomingEvents || [],
