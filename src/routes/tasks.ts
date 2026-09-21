@@ -47,15 +47,16 @@ const createSchema = z.object({
   project_id: z.string().uuid().optional().nullable(), // legacy → project entity
   assignee_id: z.string().uuid().optional(),
   assigned_person_id: z.string().uuid().optional(), // legacy alias
+  assignee_ids: z.array(z.string().uuid()).optional(),
   supervisor_id: z.string().uuid().optional().nullable(),
   due_date: z.string().min(1),
   priority: z.enum(TASK_PRIORITIES).optional(),
   status: z.enum(TASK_STATUSES).optional(),
   task_type: z.enum(['admin', 'sales']).optional(), // legacy, ignored for filtering
 }).refine((d) => Boolean(d.title || d.task_title), { message: 'Title is required', path: ['title'] })
-  .refine((d) => Boolean(d.assignee_id || d.assigned_person_id), {
-    message: 'Assignee is required',
-    path: ['assignee_id'],
+  .refine((d) => Boolean(d.assignee_id || d.assigned_person_id || (d.assignee_ids && d.assignee_ids.length)), {
+    message: 'At least one assignee is required',
+    path: ['assignee_ids'],
   })
   .refine(
     (d) => {
@@ -78,6 +79,7 @@ const updateSchema = z.object({
   project_id: z.string().uuid().optional().nullable(),
   assignee_id: z.string().uuid().optional(),
   assigned_person_id: z.string().uuid().optional(),
+  assignee_ids: z.array(z.string().uuid()).optional(),
   supervisor_id: z.string().uuid().optional().nullable(),
   due_date: z.string().optional(),
   priority: z.enum(TASK_PRIORITIES).optional(),
@@ -114,8 +116,57 @@ async function notify(userId: string | null | undefined, title: string, message:
   });
 }
 
+function uniqueIds(ids: Array<string | null | undefined>): string[] {
+  return Array.from(new Set(ids.filter((id): id is string => Boolean(id))));
+}
+
+function parseAssigneeIds(body: {
+  assignee_ids?: string[];
+  assignee_id?: string;
+  assigned_person_id?: string;
+}): string[] {
+  if (body.assignee_ids && body.assignee_ids.length) return uniqueIds(body.assignee_ids);
+  return uniqueIds([body.assignee_id, body.assigned_person_id]);
+}
+
+async function taskIdsAssignedTo(userId: string): Promise<string[]> {
+  const { data, error } = await supabase.from('task_assignees').select('task_id').eq('user_id', userId);
+  if (error) return [];
+  return (data || []).map((r: { task_id: string }) => r.task_id);
+}
+
+async function replaceAssignees(taskId: string, userIds: string[]) {
+  const unique = uniqueIds(userIds);
+  await supabase.from('task_assignees').delete().eq('task_id', taskId);
+  if (!unique.length) return unique;
+  const { error } = await supabase
+    .from('task_assignees')
+    .insert(unique.map((user_id) => ({ task_id: taskId, user_id })));
+  if (error) console.error('[task_assignees]', error.message);
+  return unique;
+}
+
+async function assigneeMapFor(taskIds: string[]): Promise<Record<string, string[]>> {
+  const map: Record<string, string[]> = {};
+  if (!taskIds.length) return map;
+  const { data, error } = await supabase.from('task_assignees').select('task_id, user_id').in('task_id', taskIds);
+  if (error) return map;
+  for (const row of data || []) {
+    if (!map[row.task_id]) map[row.task_id] = [];
+    map[row.task_id].push(row.user_id);
+  }
+  return map;
+}
+
+function personPayload(u: any) {
+  if (!u) return null;
+  return { id: u.id, name: u.full_name || u.email || 'Unknown', email: u.email || '' };
+}
+
 async function enrichTasks(tasks: any[]) {
   if (!tasks.length) return [];
+
+  const assigneeByTask = await assigneeMapFor(tasks.map((t) => t.id));
 
   const personIds = new Set<string>();
   const projectIds = new Set<string>();
@@ -124,6 +175,7 @@ async function enrichTasks(tasks: any[]) {
     if (t.assigned_person_id) personIds.add(t.assigned_person_id);
     if (t.supervisor_id) personIds.add(t.supervisor_id);
     if (t.created_by) personIds.add(t.created_by);
+    for (const id of assigneeByTask[t.id] || []) personIds.add(id);
     if (t.entity_type === 'project' && t.entity_id) projectIds.add(t.entity_id);
     else if (t.entity_type === 'job' && t.entity_id) jobIds.add(t.entity_id);
     else if (t.project_id) projectIds.add(t.project_id);
@@ -166,9 +218,12 @@ async function enrichTasks(tasks: any[]) {
   }
 
   return tasks.map((t) => {
-    const assignee = t.assigned_person_id ? usersById[t.assigned_person_id] : null;
-    const supervisor = t.supervisor_id ? usersById[t.supervisor_id] : null;
-    const creator = t.created_by ? usersById[t.created_by] : null;
+    const extraIds = assigneeByTask[t.id] || [];
+    const assigneeIds = uniqueIds([t.assigned_person_id, ...extraIds]);
+    const assignees = assigneeIds.map((id) => personPayload(usersById[id])).filter(Boolean);
+    const assignee = assignees[0] || (t.assigned_person_id ? personPayload(usersById[t.assigned_person_id]) : null);
+    const supervisor = personPayload(usersById[t.supervisor_id] || null);
+    const creator = personPayload(usersById[t.created_by] || null);
     const projectKey = t.entity_type === 'project' ? t.entity_id : t.project_id;
     const project = projectKey ? projectsById[projectKey] : null;
     const job = t.entity_type === 'job' && t.entity_id ? jobsById[t.entity_id] : null;
@@ -176,21 +231,14 @@ async function enrichTasks(tasks: any[]) {
       ...t,
       title: t.task_title,
       description: t.notes,
-      assignee_id: t.assigned_person_id,
+      assignee_id: assigneeIds[0] || t.assigned_person_id,
+      assignee_ids: assigneeIds,
+      assignees,
       overdue: isOverdue(t),
-      assignee: assignee
-        ? { id: assignee.id, name: assignee.full_name || assignee.email || 'Unknown', email: assignee.email || '' }
-        : null,
-      supervisor: supervisor
-        ? {
-            id: supervisor.id,
-            name: supervisor.full_name || supervisor.email || 'Unknown',
-            email: supervisor.email || '',
-          }
-        : null,
-      creator: creator
-        ? { id: creator.id, name: creator.full_name || creator.email || 'Unknown', email: creator.email || '' }
-        : null,
+      assignee,
+      assigned_person: assignee,
+      supervisor,
+      creator,
       project: project
         ? { id: project.id, project_id: project.project_id, project_name: project.project_name }
         : null,
@@ -204,10 +252,17 @@ async function enrichTasks(tasks: any[]) {
   });
 }
 
+function isAssignee(task: any, userId?: string) {
+  if (!userId) return false;
+  if (task.assigned_person_id === userId) return true;
+  if (Array.isArray(task.assignee_ids) && task.assignee_ids.includes(userId)) return true;
+  return false;
+}
+
 function canComplete(task: any, userId?: string, role?: string) {
   if (!userId) return false;
   if (isPrivileged(role)) return true;
-  return task.assigned_person_id === userId || task.supervisor_id === userId;
+  return isAssignee(task, userId) || task.supervisor_id === userId;
 }
 
 function canDelete(task: any, userId?: string, role?: string) {
@@ -219,11 +274,7 @@ function canDelete(task: any, userId?: string, role?: string) {
 function canEdit(task: any, userId?: string, role?: string) {
   if (!userId) return false;
   if (isPrivileged(role)) return true;
-  return (
-    task.assigned_person_id === userId ||
-    task.supervisor_id === userId ||
-    task.created_by === userId
-  );
+  return isAssignee(task, userId) || task.supervisor_id === userId || task.created_by === userId;
 }
 
 function applyAssignedDateRange(query: any, from: string, to: string, col: string) {
@@ -290,9 +341,14 @@ router.get('/', async (req, res) => {
       let query = supabase.from('tasks').select('*', { count: 'exact' }).is('deleted_at', null);
 
       if (view === 'mine') {
-        query = query.or(
-          `assigned_person_id.eq.${userId},created_by.eq.${userId},supervisor_id.eq.${userId}`,
-        );
+        const extraIds = await taskIdsAssignedTo(userId);
+        const parts = [
+          `assigned_person_id.eq.${userId}`,
+          `created_by.eq.${userId}`,
+          `supervisor_id.eq.${userId}`,
+        ];
+        if (extraIds.length) parts.push(`id.in.(${extraIds.join(',')})`);
+        query = query.or(parts.join(','));
       } else if (view === 'sales') {
         query = query.or(`entity_type.is.null,entity_type.in.(${SALES_TYPES.join(',')})`);
       } else if (view === 'operations') {
@@ -305,7 +361,12 @@ router.get('/', async (req, res) => {
 
       if (status && status !== 'all') query = query.eq('status', String(status));
       if (priority && priority !== 'all') query = query.eq('priority', String(priority));
-      if (assignee_id) query = query.eq('assigned_person_id', String(assignee_id));
+      if (assignee_id) {
+        const extra = await taskIdsAssignedTo(String(assignee_id));
+        const parts = [`assigned_person_id.eq.${assignee_id}`];
+        if (extra.length) parts.push(`id.in.(${extra.join(',')})`);
+        query = query.or(parts.join(','));
+      }
       if (entity_type && view !== 'entity') query = query.eq('entity_type', String(entity_type));
       if (entity_id && view !== 'entity') query = query.eq('entity_id', String(entity_id));
 
@@ -387,7 +448,8 @@ router.post('/', async (req, res) => {
 
   const body = parsed.data;
   const title = (body.title || body.task_title || '').trim();
-  const assignee = body.assignee_id || body.assigned_person_id!;
+  const assigneeIds = parseAssigneeIds(body);
+  const assignee = assigneeIds[0];
   let entityType = body.entity_type ?? null;
   let entityId = body.entity_id ?? null;
   if (!entityType && body.project_id) {
@@ -414,8 +476,11 @@ router.post('/', async (req, res) => {
   const { data, error } = await supabase.from('tasks').insert(row).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
-  if (assignee !== userId) {
-    await notify(assignee, 'New task assigned', `"${title}" was assigned to you.`);
+  await replaceAssignees(data.id, assigneeIds);
+  for (const id of assigneeIds) {
+    if (id !== userId) {
+      await notify(id, 'New task assigned', `"${title}" was assigned to you.`);
+    }
   }
 
   const [enriched] = await enrichTasks([data]);
@@ -434,6 +499,8 @@ router.put('/:id', async (req, res) => {
     .is('deleted_at', null)
     .maybeSingle();
   if (!existing) return res.status(404).json({ error: 'Task not found' });
+  const existingAssigneeMap = await assigneeMapFor([existing.id]);
+  existing.assignee_ids = existingAssigneeMap[existing.id] || uniqueIds([existing.assigned_person_id]);
   if (!canEdit(existing, userId, role)) {
     return res.status(403).json({ error: 'You can only edit tasks you own, supervise, or created' });
   }
@@ -450,8 +517,11 @@ router.put('/:id', async (req, res) => {
   if (body.description !== undefined || body.notes !== undefined) {
     patch.notes = body.description ?? body.notes ?? null;
   }
-  if (body.assignee_id || body.assigned_person_id) {
-    patch.assigned_person_id = body.assignee_id || body.assigned_person_id;
+  if (body.assignee_ids || body.assignee_id || body.assigned_person_id) {
+    const nextIds = parseAssigneeIds(body);
+    if (nextIds.length) {
+      patch.assigned_person_id = nextIds[0];
+    }
   }
   if (body.supervisor_id !== undefined) patch.supervisor_id = body.supervisor_id;
   if (body.due_date) patch.due_date = body.due_date;
@@ -482,7 +552,7 @@ router.put('/:id', async (req, res) => {
     }
   }
 
-  const prevAssignee = existing.assigned_person_id;
+  const prevAssignees = existing.assignee_ids || uniqueIds([existing.assigned_person_id]);
   const { data, error } = await supabase
     .from('tasks')
     .update(patch)
@@ -491,7 +561,17 @@ router.put('/:id', async (req, res) => {
     .single();
   if (error || !data) return res.status(500).json({ error: error?.message || 'Update failed' });
 
-  if (patch.assigned_person_id && patch.assigned_person_id !== prevAssignee) {
+  if (body.assignee_ids || body.assignee_id || body.assigned_person_id) {
+    const nextIds = parseAssigneeIds(body);
+    if (nextIds.length) {
+      await replaceAssignees(data.id, nextIds);
+      for (const id of nextIds) {
+        if (!prevAssignees.includes(id) && id !== userId) {
+          await notify(id, 'Task assigned to you', `"${data.task_title}" was assigned to you.`);
+        }
+      }
+    }
+  } else if (patch.assigned_person_id && patch.assigned_person_id !== existing.assigned_person_id) {
     await notify(
       String(patch.assigned_person_id),
       'Task assigned to you',
@@ -539,6 +619,8 @@ router.post('/:id/complete', async (req, res) => {
     .is('deleted_at', null)
     .maybeSingle();
   if (!existing) return res.status(404).json({ error: 'Task not found' });
+  const completeAssigneeMap = await assigneeMapFor([existing.id]);
+  existing.assignee_ids = completeAssigneeMap[existing.id] || uniqueIds([existing.assigned_person_id]);
   if (!canComplete(existing, userId, role)) {
     return res.status(403).json({ error: 'Only assignee, supervisor, or manager can complete this task' });
   }
@@ -739,12 +821,11 @@ export async function notifyOverdueTasks() {
     return m ? `${m[3]}/${m[2]}/${m[1]}` : raw || '';
   };
 
+  const extraByTask = await assigneeMapFor((data || []).map((t: { id: string }) => t.id));
   for (const t of data || []) {
     const msg = `"${t.task_title}" is overdue (due ${formatDue(t.due_date)}).`;
-    await notify(t.assigned_person_id, 'Task overdue', msg);
-    if (t.supervisor_id && t.supervisor_id !== t.assigned_person_id) {
-      await notify(t.supervisor_id, 'Task overdue', msg);
-    }
+    const people = uniqueIds([t.assigned_person_id, t.supervisor_id, ...(extraByTask[t.id] || [])]);
+    for (const id of people) await notify(id, 'Task overdue', msg);
   }
   return (data || []).length;
 }

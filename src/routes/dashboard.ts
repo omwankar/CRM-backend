@@ -35,7 +35,13 @@ router.get('/stats', async (req, res) => {
       .is('deleted_at', null)
       .order('due_date', { ascending: true })
       .limit(12);
-    if (!isSuperAdmin) tasksListQuery = tasksListQuery.eq('assigned_person_id', userId);
+    if (!isSuperAdmin) {
+      const { data: extra } = await supabase.from('task_assignees').select('task_id').eq('user_id', userId);
+      const extraIds = (extra || []).map((r: { task_id: string }) => r.task_id);
+      const parts = [`assigned_person_id.eq.${userId}`];
+      if (extraIds.length) parts.push(`id.in.(${extraIds.join(',')})`);
+      tasksListQuery = tasksListQuery.or(parts.join(','));
+    }
 
     let projectsListQuery = supabase
       .from('projects')
