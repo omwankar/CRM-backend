@@ -16,6 +16,11 @@ function isSuperAdminRole(role?: string) {
   return normalizeAppRole(role) === "super_admin";
 }
 
+function canReviewTimesheets(role?: string) {
+  const normalized = normalizeAppRole(role);
+  return normalized === "super_admin" || normalized === "manager";
+}
+
 const schema = z.object({
   log_date: z.string(),
   duration_minutes: z.number().int().min(0).optional().default(0),
@@ -104,7 +109,7 @@ async function attachPeopleAndComments(logs: any[]) {
 async function loadOwnedLog(id: string, userId: string, role?: string) {
   const { data } = await supabase.from("time_logs").select("id, user_id, log_date, description").eq("id", id).maybeSingle();
   if (!data) return { ok: false as const, status: 404, error: "Not found" };
-  if (data.user_id !== userId && !isSuperAdminRole(role)) {
+  if (data.user_id !== userId && !canReviewTimesheets(role)) {
     return { ok: false as const, status: 403, error: "You can only open your own timesheet" };
   }
   return { ok: true as const, log: data };
@@ -122,9 +127,9 @@ router.get("/", async (req, res) => {
   const monthEnd = new Date(year, mon, 0).toISOString().slice(0, 10);
 
   const requestedUser = req.query.user_id as string | undefined;
-  const superAdmin = isSuperAdminRole(role);
+  const reviewer = canReviewTimesheets(role);
 
-  if (requestedUser && !superAdmin) {
+  if (requestedUser && !reviewer) {
     return res.status(403).json({ error: "You can only view your own timesheet" });
   }
 
@@ -137,7 +142,7 @@ router.get("/", async (req, res) => {
     .order("created_at", { ascending: false })
     .limit(500);
 
-  if (!superAdmin) {
+  if (!reviewer) {
     query = query.eq("user_id", userId);
   } else if (requestedUser) {
     query = query.eq("user_id", requestedUser);

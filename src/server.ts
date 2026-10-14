@@ -35,6 +35,7 @@ import { registerTimeLogRoutes } from "./routes/timelogs.js";
 import { registerNotificationRoutes } from "./routes/notifications.js";
 import { registerLeadRoutes } from "./routes/leads.js";
 import { registerEnquiryRoutes } from "./routes/enquiries.js";
+import { registerOperationsRoutes } from "./routes/operations.js";
 import { registerOpportunityRoutes } from "./routes/opportunities.js";
 import { registerCompanyRoutes } from "./routes/companies.js";
 import { registerActivityRoutes } from "./routes/activities.js";
@@ -67,6 +68,12 @@ const allowedOrigins = new Set([
   normalizeOrigin(env.FRONTEND_ORIGIN),
   ...extraOrigins.map(normalizeOrigin),
 ]);
+
+if (process.env.NODE_ENV !== "production") {
+  for (const origin of ["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"]) {
+    allowedOrigins.add(origin);
+  }
+}
 
 app.use(
   cors({
@@ -114,6 +121,7 @@ registerTimeLogRoutes(api);
 registerNotificationRoutes(api);
 registerLeadRoutes(api);
 registerEnquiryRoutes(api);
+registerOperationsRoutes(api);
 registerOpportunityRoutes(api);
 registerCompanyRoutes(api);
 registerActivityRoutes(api);

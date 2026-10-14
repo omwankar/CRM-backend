@@ -56,6 +56,12 @@ async function logActivity(userId: string, action: string, entityId?: string, me
   });
 }
 
+async function userInOperations(userId?: string) {
+  if (!userId) return false;
+  const { data } = await supabase.from('users').select('in_operations').eq('id', userId).maybeSingle();
+  return Boolean(data?.in_operations);
+}
+
 function sanitizeIlikeSearch(raw: unknown): string {
   return String(raw || '')
     .replace(/[%_,()]/g, ' ')
@@ -87,7 +93,8 @@ router.get('/', async (req, res) => {
     }
   }
 
-  if (role === 'user' && userId) {
+  const operationsReader = role === 'user' && userId ? await userInOperations(userId) : false;
+  if (role === 'user' && userId && !operationsReader) {
     query = query.or(`created_by.eq.${userId},owner_id.eq.${userId}`);
   }
 
@@ -106,7 +113,8 @@ router.get('/', async (req, res) => {
         );
       }
     }
-    if (role === 'user' && userId) {
+    const operationsReader = role === 'user' && userId ? await userInOperations(userId) : false;
+    if (role === 'user' && userId && !operationsReader) {
       fallback = fallback.or(`created_by.eq.${userId},owner_id.eq.${userId}`);
     }
     fallback = fallback.order('created_at', { ascending: false }).range((p - 1) * l, p * l - 1);
@@ -136,7 +144,8 @@ router.get('/stats', async (req, res) => {
   const userId = req.user?.id;
 
   let query = supabase.from('enquiries').select('stage');
-  if (role === 'user' && userId) {
+  const operationsReader = role === 'user' && userId ? await userInOperations(userId) : false;
+  if (role === 'user' && userId && !operationsReader) {
     query = query.or(`created_by.eq.${userId},owner_id.eq.${userId}`);
   }
 
@@ -155,14 +164,17 @@ router.get('/:id', async (req, res) => {
 
   const role = req.user?.role;
   const userId = req.user?.id;
-  if (role === 'user' && userId && data.created_by !== userId && data.owner_id !== userId) {
+  const operationsReader = role === 'user' && userId ? await userInOperations(userId) : false;
+  if (role === 'user' && userId && data.created_by !== userId && data.owner_id !== userId && !operationsReader) {
     return res.status(403).json({ error: 'You do not have access to this enquiry' });
   }
 
   const [{ data: quotations }, { data: owner }, { data: buyer }, { data: project }] = await Promise.all([
     supabase
       .from('quotations')
-      .select('id, quotation_number, status, quote_sent_at, created_at, clarusto_final_price, revised_price')
+      .select(
+        'id, quotation_number, status, quote_sent_at, quote_sent_to_email, created_at, chosen_quote_id, clarusto_final_price, clarusto_final_currency, clarusto_final_notes, clarusto_quote_sent_at, revised_price, revised_currency, revised_notes, revised_at',
+      )
       .eq('enquiry_id', data.id)
       .order('created_at', { ascending: false }),
     data.owner_id
@@ -176,9 +188,54 @@ router.get('/:id', async (req, res) => {
       : Promise.resolve({ data: null } as any),
   ]);
 
+  const quotationRows = quotations || [];
+  const quotationIds = quotationRows.map((q: { id: string }) => q.id);
+  let vendorQuotes: Array<{ quotation_id: string; logged_by?: string | null }> = [];
+  if (quotationIds.length) {
+    const withLogger = await supabase
+      .from('quotation_vendor_quotes')
+      .select('id, quotation_id, vendor_name, quoted_price, currency, quote_received_at, is_chosen, vendor_quote_number, notes, logged_by')
+      .in('quotation_id', quotationIds)
+      .order('created_at', { ascending: true });
+    if (withLogger.error && /logged_by/i.test(withLogger.error.message)) {
+      const plain = await supabase
+        .from('quotation_vendor_quotes')
+        .select('id, quotation_id, vendor_name, quoted_price, currency, quote_received_at, is_chosen, vendor_quote_number, notes')
+        .in('quotation_id', quotationIds)
+        .order('created_at', { ascending: true });
+      if (plain.error) return res.status(500).json({ error: plain.error.message });
+      vendorQuotes = plain.data || [];
+    } else if (withLogger.error) {
+      return res.status(500).json({ error: withLogger.error.message });
+    } else {
+      vendorQuotes = withLogger.data || [];
+    }
+  }
+  const loggerIds = Array.from(new Set(vendorQuotes.map((quote) => quote.logged_by).filter(Boolean))) as string[];
+  let loggerNames: Record<string, string> = {};
+  if (loggerIds.length) {
+    const { data: loggers } = await supabase.from('users').select('id, full_name').in('id', loggerIds);
+    loggerNames = (loggers || []).reduce((acc: Record<string, string>, person) => {
+      acc[person.id] = person.full_name || 'Operations';
+      return acc;
+    }, {});
+  }
+  const quotesByQuotation = new Map<string, Array<Record<string, unknown>>>();
+  for (const quote of vendorQuotes) {
+    const list = quotesByQuotation.get(quote.quotation_id) || [];
+    list.push({
+      ...quote,
+      logged_by_name: quote.logged_by ? loggerNames[quote.logged_by] || null : null,
+    });
+    quotesByQuotation.set(quote.quotation_id, list);
+  }
+
   res.json({
     ...data,
-    quotations: quotations || [],
+    quotations: quotationRows.map((q: { id: string }) => ({
+      ...q,
+      quotation_vendor_quotes: quotesByQuotation.get(q.id) || [],
+    })),
     owner: owner || null,
     buyer: buyer || null,
     project: project || null,
@@ -231,7 +288,7 @@ router.put('/:id', async (req, res) => {
   if (!existing) return res.status(404).json({ error: 'Enquiry not found' });
 
   const role = req.user?.role;
-  const isPrivileged = role === 'manager' || role === 'super_admin';
+  const isPrivileged = role === 'manager' || role === 'super_admin' || (await userInOperations(userId));
   if (!isPrivileged && existing.created_by !== userId && existing.owner_id !== userId) {
     return res.status(403).json({ error: 'You can only edit enquiries you created or own' });
   }
