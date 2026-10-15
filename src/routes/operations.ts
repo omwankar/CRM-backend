@@ -352,6 +352,42 @@ router.post("/enquiries/:id/join", async (req, res) => {
   res.json({ ok: true });
 });
 
+// PUT /api/operations/enquiries/:id/assignees — super admin picks who works this inquiry
+router.put("/enquiries/:id/assignees", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  if (!access.superAdmin) return res.status(403).json({ error: "Only a super admin can choose who works an inquiry" });
+
+  const parsed = z.object({ user_ids: z.array(z.string().uuid()) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Choose the people for this inquiry" });
+
+  const { data: enquiry } = await supabase.from("enquiries").select("id, stage").eq("id", req.params.id).maybeSingle();
+  if (!enquiry) return res.status(404).json({ error: "Enquiry not found" });
+  if (CLOSED.includes(enquiry.stage)) return res.status(400).json({ error: "This enquiry is already closed" });
+
+  const userIds = Array.from(new Set(parsed.data.user_ids));
+  const { data: existing, error: existingError } = await supabase
+    .from("enquiry_operators")
+    .select("user_id")
+    .eq("enquiry_id", enquiry.id);
+  if (existingError) return res.status(500).json({ error: existingError.message });
+
+  const keep = new Set(userIds);
+  const remove = (existing || []).map((row) => row.user_id).filter((id) => !keep.has(id));
+  if (remove.length) {
+    const removed = await supabase.from("enquiry_operators").delete().eq("enquiry_id", enquiry.id).in("user_id", remove);
+    if (removed.error) return res.status(500).json({ error: removed.error.message });
+  }
+  if (userIds.length) {
+    const saved = await supabase.from("enquiry_operators").upsert(
+      userIds.map((userId) => ({ enquiry_id: enquiry.id, user_id: userId, status: "working" })),
+      { onConflict: "enquiry_id,user_id", ignoreDuplicates: true },
+    );
+    if (saved.error) return res.status(500).json({ error: saved.error.message });
+  }
+  res.json({ ok: true, user_ids: userIds });
+});
+
 // POST /api/operations/enquiries/:id/agents
 router.post("/enquiries/:id/agents", async (req, res) => {
   const access = await requireOperations(req, res);
