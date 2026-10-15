@@ -86,43 +86,67 @@ async function ensureQuotation(enquiry: Record<string, any>, userId: string) {
   return data;
 }
 
+function columnFor(sends: Array<{ quoted_price?: number | null; is_best?: boolean }>) {
+  if (!sends.length) return "to_send";
+  if (sends.some((send) => send.is_best)) return "best_selected";
+  if (sends.some((send) => send.quoted_price != null)) return "choose_best";
+  return "waiting";
+}
+
+function routeLine(row: { title?: string | null; requirement?: string | null }) {
+  const line = String(row.requirement || "").split("\n").map((part) => part.trim()).find(Boolean);
+  return line || row.title || "";
+}
+
 // GET /api/operations/pipeline
 router.get("/pipeline", async (req, res) => {
   const access = await requireOperations(req, res);
   if (!access) return;
 
-  const [{ data: members }, { data: enquiries, error }] = await Promise.all([
+  const includeClosed = req.query.closed === "1";
+  let enquiryQuery = supabase
+    .from("enquiries")
+    .select("id, enquiry_number, title, requirement, stage, created_at, created_by, prospect_name, client_currency, standalone_project_name")
+    .order("created_at", { ascending: true })
+    .limit(200);
+  if (!includeClosed) {
+    enquiryQuery = enquiryQuery.neq("stage", "won_closed").neq("stage", "lost_closed");
+  }
+
+  const [{ data: members }, { data: enquiries, error }, { data: directory, error: directoryError }] = await Promise.all([
     supabase.from("users").select("id, full_name").eq("in_operations", true).eq("is_active", true).order("full_name"),
-    supabase
-      .from("enquiries")
-      .select("id, enquiry_number, title, requirement, stage, created_at, prospect_name, client_currency, standalone_project_name")
-      .neq("stage", "won_closed")
-      .neq("stage", "lost_closed")
-      .order("created_at", { ascending: true })
-      .limit(150),
+    enquiryQuery,
+    supabase.from("operations_agents").select("id, company_name, contact_name, email, created_at").order("company_name"),
   ]);
 
   if (error) return res.status(500).json({ error: error.message });
+  if (directoryError) return res.status(500).json({ error: directoryError.message });
 
   const rows = enquiries || [];
   const ids = rows.map((row) => row.id);
-  let operators: Array<{ enquiry_id: string; user_id: string; status: string }> = [];
+  let operators: Array<{ enquiry_id: string; user_id: string; status: string; joined_at: string }> = [];
   let sends: Array<Record<string, any>> = [];
+  let updates: Array<Record<string, any>> = [];
   if (ids.length) {
-    const [opRes, sendRes] = await Promise.all([
+    const [opRes, sendRes, updateRes] = await Promise.all([
       supabase.from("enquiry_operators").select("enquiry_id, user_id, status, joined_at").in("enquiry_id", ids),
       supabase.from("enquiry_agent_sends").select("*").in("enquiry_id", ids).order("sent_at", { ascending: true }),
+      supabase.from("enquiry_updates").select("id, enquiry_id, user_id, body, created_at").in("enquiry_id", ids).order("created_at", { ascending: false }),
     ]);
     if (opRes.error) return res.status(500).json({ error: opRes.error.message });
     if (sendRes.error) return res.status(500).json({ error: sendRes.error.message });
+    if (updateRes.error) return res.status(500).json({ error: updateRes.error.message });
     operators = opRes.data || [];
     sends = sendRes.data || [];
+    updates = updateRes.data || [];
   }
 
   const nameIds = new Set<string>([
     ...(members || []).map((m) => m.id),
     ...operators.map((o) => o.user_id),
     ...sends.map((s) => s.user_id),
+    ...updates.map((u) => u.user_id).filter(Boolean),
+    ...rows.map((row) => row.created_by).filter(Boolean),
   ]);
   let names: Record<string, string> = {};
   if (nameIds.size) {
@@ -133,42 +157,149 @@ router.get("/pipeline", async (req, res) => {
     }, {});
   }
 
-  const openIds = new Set(ids);
-  const workloadMap = new Map<string, { user_id: string; full_name: string; open_count: number }>();
+  const openRows = rows.filter((row) => !CLOSED.includes(row.stage));
+  const openIds = new Set(openRows.map((row) => row.id));
+  const rank = new Map(openRows.map((row, index) => [row.id, index + 1]));
+
+  const workloadMap = new Map<string, { user_id: string; full_name: string; open_count: number; rates_awaited: number }>();
   for (const member of members || []) {
-    workloadMap.set(member.id, { user_id: member.id, full_name: member.full_name || "Operations", open_count: 0 });
-  }
-  for (const op of operators) {
-    if (!openIds.has(op.enquiry_id)) continue;
-    const current = workloadMap.get(op.user_id) || {
-      user_id: op.user_id,
-      full_name: names[op.user_id] || "Operations",
+    workloadMap.set(member.id, {
+      user_id: member.id,
+      full_name: member.full_name || "Operations",
       open_count: 0,
-    };
-    current.open_count += 1;
-    workloadMap.set(op.user_id, current);
+      rates_awaited: 0,
+    });
   }
 
-  const inquiries = rows.map((row) => ({
-    ...row,
-    operators: operators
-      .filter((op) => op.enquiry_id === row.id)
-      .map((op) => ({
+  const inquiries = rows.map((row) => {
+    const rowSends = sends.filter((send) => send.enquiry_id === row.id);
+    const rowOps = operators.filter((op) => op.enquiry_id === row.id);
+    return {
+      ...row,
+      route: routeLine(row),
+      column: CLOSED.includes(row.stage) ? "closed" : columnFor(rowSends),
+      priority_rank: rank.get(row.id) ?? null,
+      rates_sent: rowSends.length,
+      rates_received: rowSends.filter((send) => send.quoted_price != null).length,
+      operators: rowOps.map((op) => ({
         user_id: op.user_id,
         full_name: names[op.user_id] || "Operations",
         status: op.status,
       })),
-    sends: sends
-      .filter((send) => send.enquiry_id === row.id)
-      .map((send) => ({
+      sends: rowSends.map((send) => ({
         ...send,
         user_name: names[send.user_id] || "Operations",
       })),
-  }));
+      updates: updates
+        .filter((update) => update.enquiry_id === row.id)
+        .map((update) => ({
+          ...update,
+          user_name: names[update.user_id] || "Operations",
+        })),
+    };
+  });
+
+  for (const inquiry of inquiries) {
+    if (!openIds.has(inquiry.id)) continue;
+    for (const op of inquiry.operators) {
+      const current = workloadMap.get(op.user_id) || {
+        user_id: op.user_id,
+        full_name: op.full_name,
+        open_count: 0,
+        rates_awaited: 0,
+      };
+      current.open_count += 1;
+      const own = (inquiry.sends as unknown as Array<{ user_id: string; quoted_price?: number | null }>).filter((send) => send.user_id === op.user_id);
+      if (!own.some((send) => send.quoted_price != null)) current.rates_awaited += 1;
+      workloadMap.set(op.user_id, current);
+    }
+  }
+
+  const numberById = new Map(rows.map((row) => [row.id, row.enquiry_number]));
+  const activity: Array<{ id: string; at: string; user_id: string | null; user_name: string; enquiry_id: string; enquiry_number: string; text: string }> = [];
+  for (const row of rows) {
+    activity.push({
+      id: `created-${row.id}`,
+      at: row.created_at,
+      user_id: row.created_by,
+      user_name: names[row.created_by] || "Operations",
+      enquiry_id: row.id,
+      enquiry_number: row.enquiry_number,
+      text: "created the inquiry",
+    });
+  }
+  for (const op of operators) {
+    activity.push({
+      id: `join-${op.enquiry_id}-${op.user_id}`,
+      at: op.joined_at,
+      user_id: op.user_id,
+      user_name: names[op.user_id] || "Operations",
+      enquiry_id: op.enquiry_id,
+      enquiry_number: numberById.get(op.enquiry_id) || "",
+      text: "started work",
+    });
+  }
+  for (const send of sends) {
+    activity.push({
+      id: `send-${send.id}`,
+      at: send.sent_at,
+      user_id: send.user_id,
+      user_name: names[send.user_id] || "Operations",
+      enquiry_id: send.enquiry_id,
+      enquiry_number: numberById.get(send.enquiry_id) || "",
+      text: `contacted ${send.agent_name}`,
+    });
+    if (send.quoted_price != null) {
+      activity.push({
+        id: `rate-${send.id}`,
+        at: send.quoted_at || send.sent_at,
+        user_id: send.user_id,
+        user_name: names[send.user_id] || "Operations",
+        enquiry_id: send.enquiry_id,
+        enquiry_number: numberById.get(send.enquiry_id) || "",
+        text: `got a quote from ${send.agent_name}`,
+      });
+    }
+    if (send.is_best) {
+      activity.push({
+        id: `best-${send.id}`,
+        at: send.chosen_at || send.quoted_at || send.sent_at,
+        user_id: send.user_id,
+        user_name: names[send.user_id] || "Operations",
+        enquiry_id: send.enquiry_id,
+        enquiry_number: numberById.get(send.enquiry_id) || "",
+        text: `chose ${send.agent_name} as best quote`,
+      });
+    }
+  }
+  for (const update of updates) {
+    activity.push({
+      id: `update-${update.id}`,
+      at: update.created_at,
+      user_id: update.user_id,
+      user_name: names[update.user_id] || "Operations",
+      enquiry_id: update.enquiry_id,
+      enquiry_number: numberById.get(update.enquiry_id) || "",
+      text: `posted: ${update.body}`,
+    });
+  }
+  activity.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+
+  const agentStats = (directory || []).map((agent) => {
+    const matched = sends.filter((send) => String(send.agent_name || "").trim().toLowerCase() === String(agent.company_name || "").trim().toLowerCase());
+    return {
+      ...agent,
+      requests: matched.length,
+      rates: matched.filter((send) => send.quoted_price != null).length,
+      chosen: matched.filter((send) => send.is_best).length,
+    };
+  });
 
   res.json({
     workload: Array.from(workloadMap.values()).sort((a, b) => b.open_count - a.open_count || a.full_name.localeCompare(b.full_name)),
     inquiries,
+    activity: activity.slice(0, 80),
+    agents: agentStats,
     viewer_is_super_admin: access.superAdmin,
   });
 });
@@ -227,7 +358,10 @@ router.post("/enquiries/:id/agents", async (req, res) => {
   if (!access) return;
 
   const parsed = z.object({
-    agent_name: z.string().trim().min(2),
+    agent_name: z.string().trim().min(2).optional(),
+    contact_name: z.string().trim().optional().nullable(),
+    contact_email: z.string().trim().optional().nullable(),
+    saved_agent_ids: z.array(z.string().uuid()).optional(),
     vendor_id: z.string().uuid().optional().nullable(),
     currency: z.string().trim().optional().nullable(),
   }).safeParse(req.body);
@@ -235,27 +369,85 @@ router.post("/enquiries/:id/agents", async (req, res) => {
 
   const { data: enquiry } = await supabase.from("enquiries").select("id, stage, client_currency").eq("id", req.params.id).maybeSingle();
   if (!enquiry) return res.status(404).json({ error: "Enquiry not found" });
+  if (CLOSED.includes(enquiry.stage)) return res.status(400).json({ error: "This enquiry is already closed" });
 
   await supabase.from("enquiry_operators").upsert(
     { enquiry_id: enquiry.id, user_id: access.userId, status: "working" },
     { onConflict: "enquiry_id,user_id", ignoreDuplicates: true },
   );
 
-  const { data, error } = await supabase
-    .from("enquiry_agent_sends")
-    .insert({
-      enquiry_id: enquiry.id,
-      user_id: access.userId,
+  const toAdd: Array<{ agent_name: string; contact_name: string | null; contact_email: string | null }> = [];
+  if (parsed.data.saved_agent_ids?.length) {
+    const { data: saved, error } = await supabase
+      .from("operations_agents")
+      .select("company_name, contact_name, email")
+      .in("id", parsed.data.saved_agent_ids);
+    if (error) return res.status(500).json({ error: error.message });
+    for (const agent of saved || []) {
+      toAdd.push({
+        agent_name: agent.company_name,
+        contact_name: agent.contact_name,
+        contact_email: agent.email,
+      });
+    }
+  }
+  if (parsed.data.agent_name) {
+    toAdd.push({
       agent_name: parsed.data.agent_name,
-      vendor_id: parsed.data.vendor_id || null,
-      currency: parsed.data.currency || enquiry.client_currency || "GBP",
-    })
-    .select("*")
-    .single();
+      contact_name: parsed.data.contact_name || null,
+      contact_email: parsed.data.contact_email || null,
+    });
+  }
+  if (!toAdd.length) return res.status(400).json({ error: "Enter the agent name" });
 
-  if (error || !data) return res.status(500).json({ error: error?.message || "Could not add the agent" });
-  res.status(201).json(data);
+  const created = [];
+  for (const agent of toAdd) {
+    await rememberAgent(agent.agent_name, agent.contact_name, agent.contact_email);
+    const { data, error } = await supabase
+      .from("enquiry_agent_sends")
+      .insert({
+        enquiry_id: enquiry.id,
+        user_id: access.userId,
+        agent_name: agent.agent_name,
+        contact_name: agent.contact_name,
+        contact_email: agent.contact_email,
+        vendor_id: parsed.data.vendor_id || null,
+        currency: parsed.data.currency || enquiry.client_currency || "GBP",
+      })
+      .select("*")
+      .single();
+    if (error || !data) return res.status(500).json({ error: error?.message || "Could not add the agent" });
+    created.push(data);
+  }
+
+  res.status(201).json(created.length === 1 ? created[0] : created);
 });
+
+async function rememberAgent(company: string, contact?: string | null, email?: string | null) {
+  const name = company.trim();
+  if (name.length < 2) return;
+  const { data: existing } = await supabase
+    .from("operations_agents")
+    .select("id, contact_name, email")
+    .ilike("company_name", name)
+    .limit(1);
+  const row = existing?.[0];
+  if (row) {
+    await supabase
+      .from("operations_agents")
+      .update({
+        contact_name: contact || row.contact_name,
+        email: email || row.email,
+      })
+      .eq("id", row.id);
+    return;
+  }
+  await supabase.from("operations_agents").insert({
+    company_name: name,
+    contact_name: contact || null,
+    email: email || null,
+  });
+}
 
 // PUT /api/operations/agents/:id — record the rate
 router.put("/agents/:id", async (req, res) => {
@@ -281,6 +473,7 @@ router.put("/agents/:id", async (req, res) => {
       quoted_price: parsed.data.quoted_price,
       currency: parsed.data.currency || send.currency,
       notes: parsed.data.notes ?? send.notes,
+      quoted_at: new Date().toISOString(),
     })
     .eq("id", send.id)
     .select("*")
@@ -363,7 +556,11 @@ router.post("/agents/:id/best", async (req, res) => {
   }
 
   await supabase.from("enquiry_agent_sends").update({ is_best: false }).eq("enquiry_id", send.enquiry_id).eq("user_id", send.user_id);
-  await supabase.from("enquiry_agent_sends").update({ is_best: true, vendor_quote_id: vendorQuoteId }).eq("id", send.id);
+  await supabase.from("enquiry_agent_sends").update({
+    is_best: true,
+    vendor_quote_id: vendorQuoteId,
+    chosen_at: new Date().toISOString(),
+  }).eq("id", send.id);
 
   await supabase.from("quotation_vendor_quotes").update({ is_chosen: false }).eq("quotation_id", quotation.id);
   await supabase
@@ -375,6 +572,98 @@ router.post("/agents/:id/best", async (req, res) => {
   await supabase.from("enquiry_operators").update({ status: "quoted" }).eq("enquiry_id", send.enquiry_id).eq("user_id", send.user_id);
 
   res.json({ ok: true, quotation_id: quotation.id, vendor_quote_id: vendorQuoteId, enquiry_number: enquiry.enquiry_number });
+});
+
+const directorySchema = z.object({
+  company_name: z.string().trim().min(2),
+  contact_name: z.string().trim().optional().nullable(),
+  email: z.string().trim().email().optional().nullable().or(z.literal("").transform(() => null)),
+});
+
+router.post("/directory", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const parsed = directorySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Enter the agent company" });
+  await rememberAgent(parsed.data.company_name, parsed.data.contact_name, parsed.data.email);
+  const { data } = await supabase.from("operations_agents").select("*").ilike("company_name", parsed.data.company_name).limit(1);
+  res.status(201).json(data?.[0] || { ok: true });
+});
+
+router.put("/directory/:id", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const parsed = directorySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Enter the agent company" });
+  const { data, error } = await supabase
+    .from("operations_agents")
+    .update({
+      company_name: parsed.data.company_name,
+      contact_name: parsed.data.contact_name || null,
+      email: parsed.data.email || null,
+    })
+    .eq("id", req.params.id)
+    .select("*")
+    .single();
+  if (error || !data) return res.status(500).json({ error: error?.message || "Could not update the agent" });
+  res.json(data);
+});
+
+router.delete("/directory/:id", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const { error } = await supabase.from("operations_agents").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+router.post("/enquiries/:id/updates", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const parsed = z.object({ body: z.string().trim().min(1).max(2000) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Write an update first" });
+  const { data: enquiry } = await supabase.from("enquiries").select("id").eq("id", req.params.id).maybeSingle();
+  if (!enquiry) return res.status(404).json({ error: "Enquiry not found" });
+  const { data, error } = await supabase
+    .from("enquiry_updates")
+    .insert({ enquiry_id: enquiry.id, user_id: access.userId, body: parsed.data.body })
+    .select("*")
+    .single();
+  if (error || !data) return res.status(500).json({ error: error?.message || "Could not post the update" });
+  res.status(201).json(data);
+});
+
+router.post("/enquiries/:id/close", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const { data, error } = await supabase
+    .from("enquiries")
+    .update({ stage: "lost_closed", updated_by: access.userId })
+    .eq("id", req.params.id)
+    .select("id, enquiry_number, stage")
+    .single();
+  if (error || !data) return res.status(500).json({ error: error?.message || "Could not close the inquiry" });
+  res.json(data);
+});
+
+router.delete("/enquiries/:id", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const enquiryId = req.params.id;
+  const { data: quotes } = await supabase.from("quotations").select("id").eq("enquiry_id", enquiryId);
+  const quoteIds = (quotes || []).map((row) => row.id);
+  if (quoteIds.length) {
+    const removedQuotes = await supabase.from("quotation_vendor_quotes").delete().in("quotation_id", quoteIds);
+    if (removedQuotes.error) return res.status(500).json({ error: removedQuotes.error.message });
+    const removed = await supabase.from("quotations").delete().in("id", quoteIds);
+    if (removed.error) return res.status(500).json({ error: removed.error.message });
+  }
+  await supabase.from("enquiry_updates").delete().eq("enquiry_id", enquiryId);
+  await supabase.from("enquiry_agent_sends").delete().eq("enquiry_id", enquiryId);
+  await supabase.from("enquiry_operators").delete().eq("enquiry_id", enquiryId);
+  const { error } = await supabase.from("enquiries").delete().eq("id", enquiryId);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
 });
 
 export function registerOperationsRoutes(api: express.Router) {
