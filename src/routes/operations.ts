@@ -107,17 +107,22 @@ router.get("/pipeline", async (req, res) => {
   let enquiryQuery = supabase
     .from("enquiries")
     .select("id, enquiry_number, title, requirement, stage, created_at, created_by, prospect_name, client_currency, standalone_project_name")
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: false })
     .limit(200);
   if (!includeClosed) {
     enquiryQuery = enquiryQuery.neq("stage", "won_closed").neq("stage", "lost_closed");
   }
 
-  const [{ data: members }, { data: enquiries, error }, { data: directory, error: directoryError }] = await Promise.all([
+  const [{ data: members }, { data: enquiries, error }] = await Promise.all([
     supabase.from("users").select("id, full_name").eq("in_operations", true).eq("is_active", true).order("full_name"),
     enquiryQuery,
-    supabase.from("operations_agents").select("id, company_name, contact_name, email, created_at").order("company_name"),
   ]);
+  const directoryQuery = await supabase.from("operations_agents").select("id, company_name, contact_name, email, phone, created_at").order("company_name");
+  const directoryFallback = directoryQuery.error && /phone/i.test(directoryQuery.error.message || "")
+    ? await supabase.from("operations_agents").select("id, company_name, contact_name, email, created_at").order("company_name")
+    : null;
+  const directory = directoryFallback ? (directoryFallback.data || []).map((row) => ({ ...row, phone: null as string | null })) : directoryQuery.data;
+  const directoryError = directoryFallback ? directoryFallback.error : directoryQuery.error;
 
   if (error) return res.status(500).json({ error: error.message });
   if (directoryError) return res.status(500).json({ error: directoryError.message });
@@ -397,6 +402,7 @@ router.post("/enquiries/:id/agents", async (req, res) => {
     agent_name: z.string().trim().min(2).optional(),
     contact_name: z.string().trim().optional().nullable(),
     contact_email: z.string().trim().optional().nullable(),
+    contact_phone: z.string().trim().optional().nullable(),
     saved_agent_ids: z.array(z.string().uuid()).optional(),
     vendor_id: z.string().uuid().optional().nullable(),
     currency: z.string().trim().optional().nullable(),
@@ -412,18 +418,24 @@ router.post("/enquiries/:id/agents", async (req, res) => {
     { onConflict: "enquiry_id,user_id", ignoreDuplicates: true },
   );
 
-  const toAdd: Array<{ agent_name: string; contact_name: string | null; contact_email: string | null }> = [];
+  const toAdd: Array<{ agent_name: string; contact_name: string | null; contact_email: string | null; contact_phone: string | null }> = [];
   if (parsed.data.saved_agent_ids?.length) {
-    const { data: saved, error } = await supabase
+    const savedQuery = await supabase
       .from("operations_agents")
-      .select("company_name, contact_name, email")
+      .select("company_name, contact_name, email, phone")
       .in("id", parsed.data.saved_agent_ids);
+    const savedFallback = savedQuery.error && /phone/i.test(savedQuery.error.message || "")
+      ? await supabase.from("operations_agents").select("company_name, contact_name, email").in("id", parsed.data.saved_agent_ids)
+      : null;
+    const saved = savedFallback ? (savedFallback.data || []).map((row) => ({ ...row, phone: null as string | null })) : savedQuery.data;
+    const error = savedFallback ? savedFallback.error : savedQuery.error;
     if (error) return res.status(500).json({ error: error.message });
     for (const agent of saved || []) {
       toAdd.push({
         agent_name: agent.company_name,
         contact_name: agent.contact_name,
         contact_email: agent.email,
+        contact_phone: agent.phone,
       });
     }
   }
@@ -432,26 +444,30 @@ router.post("/enquiries/:id/agents", async (req, res) => {
       agent_name: parsed.data.agent_name,
       contact_name: parsed.data.contact_name || null,
       contact_email: parsed.data.contact_email || null,
+      contact_phone: parsed.data.contact_phone || null,
     });
   }
   if (!toAdd.length) return res.status(400).json({ error: "Enter the agent name" });
 
   const created = [];
   for (const agent of toAdd) {
-    await rememberAgent(agent.agent_name, agent.contact_name, agent.contact_email);
-    const { data, error } = await supabase
-      .from("enquiry_agent_sends")
-      .insert({
-        enquiry_id: enquiry.id,
-        user_id: access.userId,
-        agent_name: agent.agent_name,
-        contact_name: agent.contact_name,
-        contact_email: agent.contact_email,
-        vendor_id: parsed.data.vendor_id || null,
-        currency: parsed.data.currency || enquiry.client_currency || "GBP",
-      })
-      .select("*")
-      .single();
+    await rememberAgent(agent.agent_name, agent.contact_name, agent.contact_email, agent.contact_phone);
+    const payload = {
+      enquiry_id: enquiry.id,
+      user_id: access.userId,
+      agent_name: agent.agent_name,
+      contact_name: agent.contact_name,
+      contact_email: agent.contact_email,
+      contact_phone: agent.contact_phone,
+      vendor_id: parsed.data.vendor_id || null,
+      currency: parsed.data.currency || enquiry.client_currency || "GBP",
+    };
+    let result = await supabase.from("enquiry_agent_sends").insert(payload).select("*").single();
+    if (result.error && /contact_phone/i.test(result.error.message || "")) {
+      const { contact_phone: _phone, ...withoutPhone } = payload;
+      result = await supabase.from("enquiry_agent_sends").insert(withoutPhone).select("*").single();
+    }
+    const { data, error } = result;
     if (error || !data) return res.status(500).json({ error: error?.message || "Could not add the agent" });
     created.push(data);
   }
@@ -459,30 +475,30 @@ router.post("/enquiries/:id/agents", async (req, res) => {
   res.status(201).json(created.length === 1 ? created[0] : created);
 });
 
-async function rememberAgent(company: string, contact?: string | null, email?: string | null) {
+async function rememberAgent(company: string, contact?: string | null, email?: string | null, phone?: string | null) {
   const name = company.trim();
   if (name.length < 2) return;
-  const { data: existing } = await supabase
-    .from("operations_agents")
-    .select("id, contact_name, email")
-    .ilike("company_name", name)
-    .limit(1);
-  const row = existing?.[0];
+  const lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone").ilike("company_name", name).limit(1);
+  const existing = lookup.error && /phone/i.test(lookup.error.message || "")
+    ? await supabase.from("operations_agents").select("id, contact_name, email").ilike("company_name", name).limit(1)
+    : null;
+  const row = (existing ? existing.data : lookup.data)?.[0] as { id: string; contact_name?: string | null; email?: string | null; phone?: string | null } | undefined;
+  const next = {
+    contact_name: contact || row?.contact_name || null,
+    email: email || row?.email || null,
+    phone: phone || row?.phone || null,
+  };
   if (row) {
-    await supabase
-      .from("operations_agents")
-      .update({
-        contact_name: contact || row.contact_name,
-        email: email || row.email,
-      })
-      .eq("id", row.id);
+    const updated = await supabase.from("operations_agents").update(next).eq("id", row.id);
+    if (updated.error && /phone/i.test(updated.error.message || "")) {
+      await supabase.from("operations_agents").update({ contact_name: next.contact_name, email: next.email }).eq("id", row.id);
+    }
     return;
   }
-  await supabase.from("operations_agents").insert({
-    company_name: name,
-    contact_name: contact || null,
-    email: email || null,
-  });
+  const inserted = await supabase.from("operations_agents").insert({ company_name: name, ...next });
+  if (inserted.error && /phone/i.test(inserted.error.message || "")) {
+    await supabase.from("operations_agents").insert({ company_name: name, contact_name: next.contact_name, email: next.email });
+  }
 }
 
 // PUT /api/operations/agents/:id — record the rate
@@ -614,6 +630,7 @@ const directorySchema = z.object({
   company_name: z.string().trim().min(2),
   contact_name: z.string().trim().optional().nullable(),
   email: z.string().trim().email().optional().nullable().or(z.literal("").transform(() => null)),
+  phone: z.string().trim().optional().nullable(),
 });
 
 router.post("/directory", async (req, res) => {
@@ -621,7 +638,7 @@ router.post("/directory", async (req, res) => {
   if (!access) return;
   const parsed = directorySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Enter the agent company" });
-  await rememberAgent(parsed.data.company_name, parsed.data.contact_name, parsed.data.email);
+  await rememberAgent(parsed.data.company_name, parsed.data.contact_name, parsed.data.email, parsed.data.phone);
   const { data } = await supabase.from("operations_agents").select("*").ilike("company_name", parsed.data.company_name).limit(1);
   res.status(201).json(data?.[0] || { ok: true });
 });
@@ -631,16 +648,18 @@ router.put("/directory/:id", async (req, res) => {
   if (!access) return;
   const parsed = directorySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Enter the agent company" });
-  const { data, error } = await supabase
-    .from("operations_agents")
-    .update({
-      company_name: parsed.data.company_name,
-      contact_name: parsed.data.contact_name || null,
-      email: parsed.data.email || null,
-    })
-    .eq("id", req.params.id)
-    .select("*")
-    .single();
+  const changes = {
+    company_name: parsed.data.company_name,
+    contact_name: parsed.data.contact_name || null,
+    email: parsed.data.email || null,
+    phone: parsed.data.phone || null,
+  };
+  let result = await supabase.from("operations_agents").update(changes).eq("id", req.params.id).select("*").single();
+  if (result.error && /phone/i.test(result.error.message || "")) {
+    const { phone: _phone, ...withoutPhone } = changes;
+    result = await supabase.from("operations_agents").update(withoutPhone).eq("id", req.params.id).select("*").single();
+  }
+  const { data, error } = result;
   if (error || !data) return res.status(500).json({ error: error?.message || "Could not update the agent" });
   res.json(data);
 });
