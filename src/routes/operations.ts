@@ -14,6 +14,7 @@ router.use(auditLog);
 const CLOSED = ["won_closed", "lost_closed"];
 
 const createSchema = z.object({
+  enquiry_number: z.string().trim().min(3).max(80).optional().nullable(),
   title: z.string().trim().optional().nullable(),
   requirement: z.string().trim().min(10),
   standalone_project_name: z.string().trim().optional().nullable(),
@@ -24,6 +25,7 @@ const createSchema = z.object({
   deadline: z.string().optional().nullable(),
   priority: z.enum(["low", "medium", "high"]).optional(),
   notes: z.string().optional().nullable(),
+  user_ids: z.array(z.string().uuid()).optional(),
 });
 
 async function isOperationsMember(userId: string, role?: string) {
@@ -86,11 +88,20 @@ async function ensureQuotation(enquiry: Record<string, any>, userId: string) {
   return data;
 }
 
-function columnFor(sends: Array<{ quoted_price?: number | null; is_best?: boolean }>) {
+function hasQuote(send: { quoted_price?: number | null; notes?: string | null; is_best?: boolean }) {
+  return send.quoted_price != null || Boolean(String(send.notes || "").trim());
+}
+
+function columnFor(sends: Array<{ quoted_price?: number | null; notes?: string | null; is_best?: boolean }>) {
   if (!sends.length) return "to_send";
   if (sends.some((send) => send.is_best)) return "best_selected";
-  if (sends.some((send) => send.quoted_price != null)) return "choose_best";
+  if (sends.some((send) => hasQuote(send))) return "choose_best";
   return "waiting";
+}
+
+function firstAmount(text: string) {
+  const match = String(text || "").replace(/,/g, "").match(/(\d+(?:\.\d+)?)/);
+  return match ? Number(match[1]) : null;
 }
 
 function routeLine(row: { title?: string | null; requirement?: string | null }) {
@@ -106,7 +117,7 @@ router.get("/pipeline", async (req, res) => {
   const includeClosed = req.query.closed === "1";
   let enquiryQuery = supabase
     .from("enquiries")
-    .select("id, enquiry_number, title, requirement, stage, created_at, created_by, prospect_name, client_currency, standalone_project_name")
+    .select("id, enquiry_number, title, requirement, stage, created_at, created_by, prospect_name, client_currency, standalone_project_name, client_price_notes, outcome, notes")
     .order("created_at", { ascending: false })
     .limit(200);
   if (!includeClosed) {
@@ -185,7 +196,7 @@ router.get("/pipeline", async (req, res) => {
       column: CLOSED.includes(row.stage) ? "closed" : columnFor(rowSends),
       priority_rank: rank.get(row.id) ?? null,
       rates_sent: rowSends.length,
-      rates_received: rowSends.filter((send) => send.quoted_price != null).length,
+      rates_received: rowSends.filter((send) => hasQuote(send)).length,
       operators: rowOps.map((op) => ({
         user_id: op.user_id,
         full_name: names[op.user_id] || "Operations",
@@ -215,7 +226,7 @@ router.get("/pipeline", async (req, res) => {
       };
       current.open_count += 1;
       const own = (inquiry.sends as unknown as Array<{ user_id: string; quoted_price?: number | null }>).filter((send) => send.user_id === op.user_id);
-      if (!own.some((send) => send.quoted_price != null)) current.rates_awaited += 1;
+      if (!own.some((send) => hasQuote(send))) current.rates_awaited += 1;
       workloadMap.set(op.user_id, current);
     }
   }
@@ -254,7 +265,7 @@ router.get("/pipeline", async (req, res) => {
       enquiry_number: numberById.get(send.enquiry_id) || "",
       text: `contacted ${send.agent_name}`,
     });
-    if (send.quoted_price != null) {
+    if (hasQuote(send)) {
       activity.push({
         id: `rate-${send.id}`,
         at: send.quoted_at || send.sent_at,
@@ -295,7 +306,7 @@ router.get("/pipeline", async (req, res) => {
     return {
       ...agent,
       requests: matched.length,
-      rates: matched.filter((send) => send.quoted_price != null).length,
+      rates: matched.filter((send) => hasQuote(send)).length,
       chosen: matched.filter((send) => send.is_best).length,
     };
   });
@@ -303,7 +314,7 @@ router.get("/pipeline", async (req, res) => {
   res.json({
     workload: Array.from(workloadMap.values()).sort((a, b) => b.open_count - a.open_count || a.full_name.localeCompare(b.full_name)),
     inquiries,
-    activity: activity.slice(0, 80),
+    activity,
     agents: agentStats,
     viewer_is_super_admin: access.superAdmin,
   });
@@ -317,25 +328,34 @@ router.post("/enquiries", async (req, res) => {
   const parsed = createSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", issues: parsed.error.issues });
 
+  const { user_ids, ...fields } = parsed.data;
+  const payload: Record<string, unknown> = {
+    ...fields,
+    stage: "new_enquiry",
+    owner_id: access.userId,
+    created_by: access.userId,
+    updated_by: access.userId,
+  };
+  if (!fields.enquiry_number) delete payload.enquiry_number;
+
   const { data, error } = await supabase
     .from("enquiries")
-    .insert({
-      ...parsed.data,
-      stage: "new_enquiry",
-      owner_id: access.userId,
-      created_by: access.userId,
-      updated_by: access.userId,
-    })
+    .insert(payload)
     .select("id, enquiry_number, title, created_at")
     .single();
 
-  if (error || !data) return res.status(500).json({ error: error?.message || "Could not create the enquiry" });
+  if (error || !data) {
+    if (/enquiry_number|duplicate|unique/i.test(error?.message || "")) {
+      return res.status(409).json({ error: "That inquiry ID already exists. Edit it, or open the existing inquiry." });
+    }
+    return res.status(500).json({ error: error?.message || "Could not create the enquiry" });
+  }
 
-  await supabase.from("enquiry_operators").insert({
-    enquiry_id: data.id,
-    user_id: access.userId,
-    status: "working",
-  });
+  const assignees = Array.from(new Set([access.userId, ...(user_ids || [])]));
+  await supabase.from("enquiry_operators").upsert(
+    assignees.map((userId) => ({ enquiry_id: data.id, user_id: userId, status: "working" })),
+    { onConflict: "enquiry_id,user_id", ignoreDuplicates: true },
+  );
 
   res.status(201).json(data);
 });
@@ -507,11 +527,14 @@ router.put("/agents/:id", async (req, res) => {
   if (!access) return;
 
   const parsed = z.object({
-    quoted_price: z.number().positive(),
+    quoted_price: z.number().positive().optional().nullable(),
     currency: z.string().trim().optional().nullable(),
     notes: z.string().optional().nullable(),
   }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Enter the rate you received" });
+  if (!parsed.success) return res.status(400).json({ error: "Paste the quote you received" });
+  const quoteText = parsed.data.notes ?? undefined;
+  const amount = parsed.data.quoted_price ?? (quoteText ? firstAmount(quoteText) : null);
+  if (amount == null && !String(quoteText || "").trim()) return res.status(400).json({ error: "Paste the quote you received" });
 
   const { data: send } = await supabase.from("enquiry_agent_sends").select("*").eq("id", req.params.id).maybeSingle();
   if (!send) return res.status(404).json({ error: "Agent send not found" });
@@ -522,9 +545,9 @@ router.put("/agents/:id", async (req, res) => {
   const { data, error } = await supabase
     .from("enquiry_agent_sends")
     .update({
-      quoted_price: parsed.data.quoted_price,
+      quoted_price: amount,
       currency: parsed.data.currency || send.currency,
-      notes: parsed.data.notes ?? send.notes,
+      notes: quoteText !== undefined ? quoteText : send.notes,
       quoted_at: new Date().toISOString(),
     })
     .eq("id", send.id)
@@ -537,7 +560,7 @@ router.put("/agents/:id", async (req, res) => {
     await supabase
       .from("quotation_vendor_quotes")
       .update({
-        quoted_price: parsed.data.quoted_price,
+        quoted_price: amount,
         currency: parsed.data.currency || send.currency,
       })
       .eq("id", send.vendor_quote_id);
@@ -556,7 +579,14 @@ router.post("/agents/:id/best", async (req, res) => {
   if (send.user_id !== access.userId && !access.superAdmin) {
     return res.status(403).json({ error: "You can only choose a quote you received" });
   }
-  if (send.quoted_price == null) return res.status(400).json({ error: "Enter the rate before choosing it" });
+  if (send.quoted_price == null && !String(send.notes || "").trim()) {
+    return res.status(400).json({ error: "Paste the quote before choosing it" });
+  }
+  if (send.quoted_price == null) {
+    const amount = firstAmount(send.notes || "") || 1;
+    await supabase.from("enquiry_agent_sends").update({ quoted_price: amount }).eq("id", send.id);
+    send.quoted_price = amount;
+  }
 
   const { data: enquiry } = await supabase.from("enquiries").select("*").eq("id", send.enquiry_id).maybeSingle();
   if (!enquiry) return res.status(404).json({ error: "Enquiry not found" });
@@ -691,11 +721,22 @@ router.post("/enquiries/:id/updates", async (req, res) => {
 router.post("/enquiries/:id/close", async (req, res) => {
   const access = await requireOperations(req, res);
   if (!access) return;
+  const parsed = z.object({
+    outcome: z.enum(["Closed", "Lost", "No response", "Follow-up closed"]).optional(),
+    remark: z.string().trim().optional().nullable(),
+  }).safeParse(req.body || {});
+  const outcome = parsed.success ? parsed.data.outcome || "Closed" : "Closed";
+  const remark = parsed.success ? parsed.data.remark || null : null;
+  const stage = outcome === "Lost" ? "lost_closed" : "won_closed";
   const { data, error } = await supabase
     .from("enquiries")
-    .update({ stage: "lost_closed", updated_by: access.userId })
+    .update({
+      stage: outcome === "Lost" || outcome === "No response" ? "lost_closed" : stage,
+      outcome: [outcome, remark].filter(Boolean).join(" — "),
+      updated_by: access.userId,
+    })
     .eq("id", req.params.id)
-    .select("id, enquiry_number, stage")
+    .select("id, enquiry_number, stage, outcome")
     .single();
   if (error || !data) return res.status(500).json({ error: error?.message || "Could not close the inquiry" });
   res.json(data);
