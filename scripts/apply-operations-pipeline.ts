@@ -17,6 +17,8 @@ async function alreadyApplied() {
   const quotes = await supabase.from("quotation_vendor_quotes").select("logged_by").limit(1);
   const agents = await supabase.from("operations_agents").select("id").limit(1);
   const updates = await supabase.from("enquiry_updates").select("id").limit(1);
+  const customers = await supabase.from("operations_customers").select("id").limit(1);
+  const flagged = await supabase.from("enquiries").select("in_operations").limit(1);
   const missing = [
     users.error && "users.in_operations",
     operators.error && "enquiry_operators",
@@ -24,6 +26,8 @@ async function alreadyApplied() {
     quotes.error && "quotation_vendor_quotes.logged_by",
     agents.error && "operations_agents",
     updates.error && "enquiry_updates",
+    customers.error && "operations_customers",
+    flagged.error && "enquiries.in_operations",
   ].filter(Boolean);
   return missing.length ? missing.join(", ") : "";
 }
@@ -47,7 +51,7 @@ async function main() {
   const pg = await import("pg");
   const client = new pg.default.Client({ connectionString: dbUrl, ssl: { rejectUnauthorized: false } });
   const dir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../supabase/migrations");
-  const sql = ["052_operations_pipeline.sql", "053_operations_demo.sql"]
+  const sql = ["052_operations_pipeline.sql", "053_operations_demo.sql", "054_operations_agent_phone.sql", "055_operations_customers.sql"]
     .map((name) => fs.readFileSync(path.join(dir, name), "utf8"))
     .join("\n");
   await client.connect();

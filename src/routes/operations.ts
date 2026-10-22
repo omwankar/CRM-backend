@@ -25,6 +25,8 @@ const createSchema = z.object({
   deadline: z.string().optional().nullable(),
   priority: z.enum(["low", "medium", "high"]).optional(),
   notes: z.string().optional().nullable(),
+  customer_contact: z.string().trim().optional().nullable(),
+  customer_phone: z.string().trim().optional().nullable(),
   user_ids: z.array(z.string().uuid()).optional(),
 });
 
@@ -109,17 +111,61 @@ function routeLine(row: { title?: string | null; requirement?: string | null }) 
   return line || row.title || "";
 }
 
+async function operationsEnquiryIds() {
+  const flagged = await supabase.from("enquiries").select("id").eq("in_operations", true);
+  if (!flagged.error) return (flagged.data || []).map((row) => row.id);
+  const ops = await supabase.from("enquiry_operators").select("enquiry_id");
+  return Array.from(new Set((ops.data || []).map((row) => row.enquiry_id)));
+}
+
+async function deleteOperationsEnquiryById(enquiryId: string) {
+  const { data: quotes } = await supabase.from("quotations").select("id").eq("enquiry_id", enquiryId);
+  const quoteIds = (quotes || []).map((row) => row.id);
+  if (quoteIds.length) {
+    const removedQuotes = await supabase.from("quotation_vendor_quotes").delete().in("quotation_id", quoteIds);
+    if (removedQuotes.error) throw new Error(removedQuotes.error.message);
+    const removed = await supabase.from("quotations").delete().in("id", quoteIds);
+    if (removed.error) throw new Error(removed.error.message);
+  }
+  await supabase.from("enquiry_updates").delete().eq("enquiry_id", enquiryId);
+  await supabase.from("enquiry_agent_sends").delete().eq("enquiry_id", enquiryId);
+  await supabase.from("enquiry_operators").delete().eq("enquiry_id", enquiryId);
+  const { error } = await supabase.from("enquiries").delete().eq("id", enquiryId);
+  if (error) throw new Error(error.message);
+}
+
+async function rememberCustomer(company?: string | null, contact?: string | null, email?: string | null, phone?: string | null) {
+  const name = String(company || "").trim();
+  if (name.length < 2) return;
+  const lookup = await supabase.from("operations_customers").select("id, contact_name, email, phone").ilike("company_name", name).limit(1);
+  if (lookup.error) return;
+  const row = lookup.data?.[0];
+  const next = {
+    contact_name: contact || row?.contact_name || null,
+    email: email || row?.email || null,
+    phone: phone || row?.phone || null,
+  };
+  if (row) {
+    await supabase.from("operations_customers").update(next).eq("id", row.id);
+    return;
+  }
+  await supabase.from("operations_customers").insert({ company_name: name, ...next });
+}
+
 // GET /api/operations/pipeline
 router.get("/pipeline", async (req, res) => {
   const access = await requireOperations(req, res);
   if (!access) return;
 
   const includeClosed = req.query.closed === "1";
+  const opsIds = await operationsEnquiryIds();
   let enquiryQuery = supabase
     .from("enquiries")
-    .select("id, enquiry_number, title, requirement, stage, created_at, created_by, prospect_name, client_currency, standalone_project_name, client_price_notes, outcome, notes")
+    .select("id, enquiry_number, title, requirement, stage, created_at, created_by, prospect_name, client_email, client_currency, standalone_project_name, client_price_notes, outcome, notes")
     .order("created_at", { ascending: false })
     .limit(200);
+  if (opsIds.length) enquiryQuery = enquiryQuery.in("id", opsIds);
+  else enquiryQuery = enquiryQuery.eq("id", "00000000-0000-0000-0000-000000000000");
   if (!includeClosed) {
     enquiryQuery = enquiryQuery.neq("stage", "won_closed").neq("stage", "lost_closed");
   }
@@ -129,6 +175,7 @@ router.get("/pipeline", async (req, res) => {
     enquiryQuery,
   ]);
   const directoryQuery = await supabase.from("operations_agents").select("id, company_name, contact_name, email, phone, created_at").order("company_name");
+  const customersQuery = await supabase.from("operations_customers").select("id, company_name, contact_name, email, phone, created_at").order("company_name");
   const directoryFallback = directoryQuery.error && /phone/i.test(directoryQuery.error.message || "")
     ? await supabase.from("operations_agents").select("id, company_name, contact_name, email, created_at").order("company_name")
     : null;
@@ -137,6 +184,7 @@ router.get("/pipeline", async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
   if (directoryError) return res.status(500).json({ error: directoryError.message });
+  const customers = customersQuery.error ? [] : customersQuery.data || [];
 
   const rows = enquiries || [];
   const ids = rows.map((row) => row.id);
@@ -311,11 +359,23 @@ router.get("/pipeline", async (req, res) => {
     };
   });
 
+  const customerStats = customers.map((customer) => {
+    const company = String(customer.company_name || "").trim().toLowerCase();
+    const mail = String(customer.email || "").trim().toLowerCase();
+    const matched = inquiries.filter((inquiry) => {
+      const names = [inquiry.standalone_project_name, inquiry.prospect_name].map((value) => String(value || "").trim().toLowerCase());
+      const email = String((inquiry as { client_email?: string | null }).client_email || "").trim().toLowerCase();
+      return (company && names.some((name) => name === company || name.includes(company))) || (mail && email === mail);
+    });
+    return { ...customer, inquiries: matched.length };
+  });
+
   res.json({
     workload: Array.from(workloadMap.values()).sort((a, b) => b.open_count - a.open_count || a.full_name.localeCompare(b.full_name)),
     inquiries,
     activity,
     agents: agentStats,
+    customers: customerStats,
     viewer_is_super_admin: access.superAdmin,
   });
 });
@@ -328,21 +388,27 @@ router.post("/enquiries", async (req, res) => {
   const parsed = createSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", issues: parsed.error.issues });
 
-  const { user_ids, ...fields } = parsed.data;
+  const { user_ids, customer_phone, customer_contact, ...fields } = parsed.data;
   const payload: Record<string, unknown> = {
     ...fields,
     stage: "new_enquiry",
+    in_operations: true,
     owner_id: access.userId,
     created_by: access.userId,
     updated_by: access.userId,
   };
   if (!fields.enquiry_number) delete payload.enquiry_number;
 
-  const { data, error } = await supabase
+  let inserted = await supabase
     .from("enquiries")
     .insert(payload)
     .select("id, enquiry_number, title, created_at")
     .single();
+  if (inserted.error && /in_operations/i.test(inserted.error.message || "")) {
+    const { in_operations: _flag, ...withoutFlag } = payload;
+    inserted = await supabase.from("enquiries").insert(withoutFlag).select("id, enquiry_number, title, created_at").single();
+  }
+  const { data, error } = inserted;
 
   if (error || !data) {
     if (/enquiry_number|duplicate|unique/i.test(error?.message || "")) {
@@ -356,6 +422,7 @@ router.post("/enquiries", async (req, res) => {
     assignees.map((userId) => ({ enquiry_id: data.id, user_id: userId, status: "working" })),
     { onConflict: "enquiry_id,user_id", ignoreDuplicates: true },
   );
+  await rememberCustomer(fields.standalone_project_name, customer_contact, fields.client_email, customer_phone);
 
   res.status(201).json(data);
 });
@@ -745,19 +812,72 @@ router.post("/enquiries/:id/close", async (req, res) => {
 router.delete("/enquiries/:id", async (req, res) => {
   const access = await requireOperations(req, res);
   if (!access) return;
-  const enquiryId = req.params.id;
-  const { data: quotes } = await supabase.from("quotations").select("id").eq("enquiry_id", enquiryId);
-  const quoteIds = (quotes || []).map((row) => row.id);
-  if (quoteIds.length) {
-    const removedQuotes = await supabase.from("quotation_vendor_quotes").delete().in("quotation_id", quoteIds);
-    if (removedQuotes.error) return res.status(500).json({ error: removedQuotes.error.message });
-    const removed = await supabase.from("quotations").delete().in("id", quoteIds);
-    if (removed.error) return res.status(500).json({ error: removed.error.message });
+  try {
+    await deleteOperationsEnquiryById(req.params.id);
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Could not delete the inquiry" });
   }
-  await supabase.from("enquiry_updates").delete().eq("enquiry_id", enquiryId);
-  await supabase.from("enquiry_agent_sends").delete().eq("enquiry_id", enquiryId);
-  await supabase.from("enquiry_operators").delete().eq("enquiry_id", enquiryId);
-  const { error } = await supabase.from("enquiries").delete().eq("id", enquiryId);
+  res.json({ ok: true });
+});
+
+router.delete("/pipeline", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  if (!access.superAdmin) return res.status(403).json({ error: "Only a super admin can clear the operations pipeline" });
+  const ids = await operationsEnquiryIds();
+  let deleted = 0;
+  for (const id of ids) {
+    try {
+      await deleteOperationsEnquiryById(id);
+      deleted += 1;
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : "Could not clear the pipeline" });
+    }
+  }
+  res.json({ ok: true, deleted });
+});
+
+const customerSchema = z.object({
+  company_name: z.string().trim().min(2),
+  contact_name: z.string().trim().optional().nullable(),
+  email: z.string().trim().email().optional().nullable().or(z.literal("").transform(() => null)),
+  phone: z.string().trim().optional().nullable(),
+});
+
+router.post("/customers", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const parsed = customerSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Enter the customer company" });
+  await rememberCustomer(parsed.data.company_name, parsed.data.contact_name, parsed.data.email, parsed.data.phone);
+  const { data } = await supabase.from("operations_customers").select("*").ilike("company_name", parsed.data.company_name).limit(1);
+  res.status(201).json(data?.[0] || { ok: true });
+});
+
+router.put("/customers/:id", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const parsed = customerSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Enter the customer company" });
+  const { data, error } = await supabase
+    .from("operations_customers")
+    .update({
+      company_name: parsed.data.company_name,
+      contact_name: parsed.data.contact_name || null,
+      email: parsed.data.email || null,
+      phone: parsed.data.phone || null,
+    })
+    .eq("id", req.params.id)
+    .select("*")
+    .single();
+  if (error || !data) return res.status(500).json({ error: error?.message || "Could not update the customer" });
+  res.json(data);
+});
+
+router.delete("/customers/:id", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const { error } = await supabase.from("operations_customers").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
