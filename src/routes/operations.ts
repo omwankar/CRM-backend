@@ -538,7 +538,11 @@ router.post("/enquiries/:id/agents", async (req, res) => {
 
   const created = [];
   for (const agent of toAdd) {
-    await rememberAgent(agent.agent_name, agent.contact_name, agent.contact_email, agent.contact_phone);
+    try {
+      await rememberAgent(agent.agent_name, agent.contact_name, agent.contact_email, agent.contact_phone);
+    } catch {
+      /* directory unique index may still be in place; the inquiry send is saved anyway */
+    }
     const payload = {
       enquiry_id: enquiry.id,
       user_id: access.userId,
@@ -565,13 +569,17 @@ router.post("/enquiries/:id/agents", async (req, res) => {
 async function rememberAgent(company: string, contact?: string | null, email?: string | null, phone?: string | null) {
   const name = company.trim();
   if (name.length < 2) return;
-  const lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone").ilike("company_name", name).limit(1);
+  const who = String(contact || "").trim();
+  const lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone").ilike("company_name", name);
   const existing = lookup.error && /phone/i.test(lookup.error.message || "")
-    ? await supabase.from("operations_agents").select("id, contact_name, email").ilike("company_name", name).limit(1)
+    ? await supabase.from("operations_agents").select("id, contact_name, email").ilike("company_name", name)
     : null;
-  const row = (existing ? existing.data : lookup.data)?.[0] as { id: string; contact_name?: string | null; email?: string | null; phone?: string | null } | undefined;
+  const rows = ((existing ? existing.data : lookup.data) || []) as Array<{ id: string; contact_name?: string | null; email?: string | null; phone?: string | null }>;
+  const row = who
+    ? rows.find((item) => String(item.contact_name || "").trim().toLowerCase() === who.toLowerCase())
+    : rows.find((item) => !String(item.contact_name || "").trim()) || (rows.length === 1 ? rows[0] : undefined);
   const next = {
-    contact_name: contact || row?.contact_name || null,
+    contact_name: who || row?.contact_name || null,
     email: email || row?.email || null,
     phone: phone || row?.phone || null,
   };
@@ -584,8 +592,16 @@ async function rememberAgent(company: string, contact?: string | null, email?: s
   }
   const inserted = await supabase.from("operations_agents").insert({ company_name: name, ...next });
   if (inserted.error && /phone/i.test(inserted.error.message || "")) {
-    await supabase.from("operations_agents").insert({ company_name: name, contact_name: next.contact_name, email: next.email });
+    const retry = await supabase.from("operations_agents").insert({ company_name: name, contact_name: next.contact_name, email: next.email });
+    if (retry.error && /unique|duplicate/i.test(retry.error.message || "")) {
+      throw new Error("This company already has a contact saved. Run the agent-contacts migration to add more people, or edit the existing contact.");
+    }
+    return;
   }
+  if (inserted.error && /unique|duplicate/i.test(inserted.error.message || "")) {
+    throw new Error("This company already has a contact saved. Run supabase/migrations/056_operations_agent_contacts.sql in the Supabase SQL editor to allow more people at the same company.");
+  }
+  if (inserted.error) throw new Error(inserted.error.message);
 }
 
 // PUT /api/operations/agents/:id — record the rate
@@ -735,8 +751,14 @@ router.post("/directory", async (req, res) => {
   if (!access) return;
   const parsed = directorySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Enter the agent company" });
-  await rememberAgent(parsed.data.company_name, parsed.data.contact_name, parsed.data.email, parsed.data.phone);
-  const { data } = await supabase.from("operations_agents").select("*").ilike("company_name", parsed.data.company_name).limit(1);
+  try {
+    await rememberAgent(parsed.data.company_name, parsed.data.contact_name, parsed.data.email, parsed.data.phone);
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : "Could not save the contact" });
+  }
+  let query = supabase.from("operations_agents").select("*").ilike("company_name", parsed.data.company_name);
+  if (parsed.data.contact_name) query = query.ilike("contact_name", parsed.data.contact_name);
+  const { data } = await query.order("created_at", { ascending: false }).limit(1);
   res.status(201).json(data?.[0] || { ok: true });
 });
 
