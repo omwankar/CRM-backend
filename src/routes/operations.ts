@@ -12,6 +12,12 @@ router.use(authMiddleware);
 router.use(auditLog);
 
 const CLOSED = ["won_closed", "lost_closed"];
+const AGENT_MODES = ["Air", "Ocean", "Land"] as const;
+
+function parseAgentMode(value?: string | null) {
+  const mode = String(value || "").trim();
+  return (AGENT_MODES as readonly string[]).includes(mode) ? mode : null;
+}
 
 const createSchema = z.object({
   enquiry_number: z.string().trim().min(3).max(80).optional().nullable(),
@@ -174,12 +180,19 @@ router.get("/pipeline", async (req, res) => {
     supabase.from("users").select("id, full_name").eq("in_operations", true).eq("is_active", true).order("full_name"),
     enquiryQuery,
   ]);
-  const directoryQuery = await supabase.from("operations_agents").select("id, company_name, contact_name, email, phone, created_at").order("company_name");
+  let directoryQuery = await supabase.from("operations_agents").select("id, company_name, contact_name, email, phone, country, mode, created_at").order("company_name");
+  if (directoryQuery.error && /country|mode/i.test(directoryQuery.error.message || "")) {
+    directoryQuery = await supabase.from("operations_agents").select("id, company_name, contact_name, email, phone, created_at").order("company_name");
+  }
   const customersQuery = await supabase.from("operations_customers").select("id, company_name, contact_name, email, phone, created_at").order("company_name");
   const directoryFallback = directoryQuery.error && /phone/i.test(directoryQuery.error.message || "")
     ? await supabase.from("operations_agents").select("id, company_name, contact_name, email, created_at").order("company_name")
     : null;
-  const directory = directoryFallback ? (directoryFallback.data || []).map((row) => ({ ...row, phone: null as string | null })) : directoryQuery.data;
+  const directory = (directoryFallback ? (directoryFallback.data || []).map((row) => ({ ...row, phone: null as string | null })) : directoryQuery.data || []).map((row) => ({
+    ...row,
+    country: (row as { country?: string | null }).country ?? null,
+    mode: (row as { mode?: string | null }).mode ?? null,
+  }));
   const directoryError = directoryFallback ? directoryFallback.error : directoryQuery.error;
 
   if (error) return res.status(500).json({ error: error.message });
@@ -490,6 +503,8 @@ router.post("/enquiries/:id/agents", async (req, res) => {
     contact_name: z.string().trim().optional().nullable(),
     contact_email: z.string().trim().optional().nullable(),
     contact_phone: z.string().trim().optional().nullable(),
+    country: z.string().trim().optional().nullable(),
+    mode: z.string().trim().optional().nullable(),
     saved_agent_ids: z.array(z.string().uuid()).optional(),
     vendor_id: z.string().uuid().optional().nullable(),
     currency: z.string().trim().optional().nullable(),
@@ -505,12 +520,15 @@ router.post("/enquiries/:id/agents", async (req, res) => {
     { onConflict: "enquiry_id,user_id", ignoreDuplicates: true },
   );
 
-  const toAdd: Array<{ agent_name: string; contact_name: string | null; contact_email: string | null; contact_phone: string | null }> = [];
+  const toAdd: Array<{ agent_name: string; contact_name: string | null; contact_email: string | null; contact_phone: string | null; country: string | null; mode: string | null }> = [];
   if (parsed.data.saved_agent_ids?.length) {
-    const savedQuery = await supabase
+    let savedQuery = await supabase
       .from("operations_agents")
-      .select("company_name, contact_name, email, phone")
+      .select("company_name, contact_name, email, phone, country, mode")
       .in("id", parsed.data.saved_agent_ids);
+    if (savedQuery.error && /country|mode/i.test(savedQuery.error.message || "")) {
+      savedQuery = await supabase.from("operations_agents").select("company_name, contact_name, email, phone").in("id", parsed.data.saved_agent_ids);
+    }
     const savedFallback = savedQuery.error && /phone/i.test(savedQuery.error.message || "")
       ? await supabase.from("operations_agents").select("company_name, contact_name, email").in("id", parsed.data.saved_agent_ids)
       : null;
@@ -523,6 +541,8 @@ router.post("/enquiries/:id/agents", async (req, res) => {
         contact_name: agent.contact_name,
         contact_email: agent.email,
         contact_phone: agent.phone,
+        country: (agent as { country?: string | null }).country || null,
+        mode: parseAgentMode((agent as { mode?: string | null }).mode),
       });
     }
   }
@@ -532,6 +552,8 @@ router.post("/enquiries/:id/agents", async (req, res) => {
       contact_name: parsed.data.contact_name || null,
       contact_email: parsed.data.contact_email || null,
       contact_phone: parsed.data.contact_phone || null,
+      country: parsed.data.country?.trim() || null,
+      mode: parseAgentMode(parsed.data.mode),
     });
   }
   if (!toAdd.length) return res.status(400).json({ error: "Enter the agent name" });
@@ -539,21 +561,27 @@ router.post("/enquiries/:id/agents", async (req, res) => {
   const created = [];
   for (const agent of toAdd) {
     try {
-      await rememberAgent(agent.agent_name, agent.contact_name, agent.contact_email, agent.contact_phone);
+      await rememberAgent(agent.agent_name, agent.contact_name, agent.contact_email, agent.contact_phone, agent.country, agent.mode);
     } catch {
       /* directory unique index may still be in place; the inquiry send is saved anyway */
     }
-    const payload = {
+    const payload: Record<string, unknown> = {
       enquiry_id: enquiry.id,
       user_id: access.userId,
       agent_name: agent.agent_name,
       contact_name: agent.contact_name,
       contact_email: agent.contact_email,
       contact_phone: agent.contact_phone,
+      country: agent.country,
+      mode: agent.mode,
       vendor_id: parsed.data.vendor_id || null,
       currency: parsed.data.currency || enquiry.client_currency || "GBP",
     };
     let result = await supabase.from("enquiry_agent_sends").insert(payload).select("*").single();
+    if (result.error && /country|mode/i.test(result.error.message || "")) {
+      const { country: _country, mode: _mode, ...withoutPlace } = payload;
+      result = await supabase.from("enquiry_agent_sends").insert(withoutPlace).select("*").single();
+    }
     if (result.error && /contact_phone/i.test(result.error.message || "")) {
       const { contact_phone: _phone, ...withoutPhone } = payload;
       result = await supabase.from("enquiry_agent_sends").insert(withoutPhone).select("*").single();
@@ -566,15 +594,25 @@ router.post("/enquiries/:id/agents", async (req, res) => {
   res.status(201).json(created.length === 1 ? created[0] : created);
 });
 
-async function rememberAgent(company: string, contact?: string | null, email?: string | null, phone?: string | null) {
+async function rememberAgent(
+  company: string,
+  contact?: string | null,
+  email?: string | null,
+  phone?: string | null,
+  country?: string | null,
+  mode?: string | null,
+) {
   const name = company.trim();
   if (name.length < 2) return;
   const who = String(contact || "").trim();
-  const lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone").ilike("company_name", name);
+  let lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone, country, mode").ilike("company_name", name);
+  if (lookup.error && /country|mode/i.test(lookup.error.message || "")) {
+    lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone").ilike("company_name", name);
+  }
   const existing = lookup.error && /phone/i.test(lookup.error.message || "")
     ? await supabase.from("operations_agents").select("id, contact_name, email").ilike("company_name", name)
     : null;
-  const rows = ((existing ? existing.data : lookup.data) || []) as Array<{ id: string; contact_name?: string | null; email?: string | null; phone?: string | null }>;
+  const rows = ((existing ? existing.data : lookup.data) || []) as Array<{ id: string; contact_name?: string | null; email?: string | null; phone?: string | null; country?: string | null; mode?: string | null }>;
   const row = who
     ? rows.find((item) => String(item.contact_name || "").trim().toLowerCase() === who.toLowerCase())
     : rows.find((item) => !String(item.contact_name || "").trim()) || (rows.length === 1 ? rows[0] : undefined);
@@ -582,15 +620,25 @@ async function rememberAgent(company: string, contact?: string | null, email?: s
     contact_name: who || row?.contact_name || null,
     email: email || row?.email || null,
     phone: phone || row?.phone || null,
+    country: String(country || "").trim() || row?.country || null,
+    mode: parseAgentMode(mode) || row?.mode || null,
   };
   if (row) {
-    const updated = await supabase.from("operations_agents").update(next).eq("id", row.id);
+    let updated = await supabase.from("operations_agents").update(next).eq("id", row.id);
+    if (updated.error && /country|mode/i.test(updated.error.message || "")) {
+      const { country: _c, mode: _m, ...withoutPlace } = next;
+      updated = await supabase.from("operations_agents").update(withoutPlace).eq("id", row.id);
+    }
     if (updated.error && /phone/i.test(updated.error.message || "")) {
       await supabase.from("operations_agents").update({ contact_name: next.contact_name, email: next.email }).eq("id", row.id);
     }
     return;
   }
-  const inserted = await supabase.from("operations_agents").insert({ company_name: name, ...next });
+  let inserted = await supabase.from("operations_agents").insert({ company_name: name, ...next });
+  if (inserted.error && /country|mode/i.test(inserted.error.message || "")) {
+    const { country: _c, mode: _m, ...withoutPlace } = next;
+    inserted = await supabase.from("operations_agents").insert({ company_name: name, ...withoutPlace });
+  }
   if (inserted.error && /phone/i.test(inserted.error.message || "")) {
     const retry = await supabase.from("operations_agents").insert({ company_name: name, contact_name: next.contact_name, email: next.email });
     if (retry.error && /unique|duplicate/i.test(retry.error.message || "")) {
@@ -744,6 +792,8 @@ const directorySchema = z.object({
   contact_name: z.string().trim().optional().nullable(),
   email: z.string().trim().email().optional().nullable().or(z.literal("").transform(() => null)),
   phone: z.string().trim().optional().nullable(),
+  country: z.string().trim().optional().nullable(),
+  mode: z.enum(["Air", "Ocean", "Land", ""]).optional().nullable(),
 });
 
 router.post("/directory", async (req, res) => {
@@ -752,7 +802,7 @@ router.post("/directory", async (req, res) => {
   const parsed = directorySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Enter the agent company" });
   try {
-    await rememberAgent(parsed.data.company_name, parsed.data.contact_name, parsed.data.email, parsed.data.phone);
+    await rememberAgent(parsed.data.company_name, parsed.data.contact_name, parsed.data.email, parsed.data.phone, parsed.data.country, parsed.data.mode);
   } catch (err) {
     return res.status(400).json({ error: err instanceof Error ? err.message : "Could not save the contact" });
   }
@@ -772,8 +822,14 @@ router.put("/directory/:id", async (req, res) => {
     contact_name: parsed.data.contact_name || null,
     email: parsed.data.email || null,
     phone: parsed.data.phone || null,
+    country: parsed.data.country?.trim() || null,
+    mode: parseAgentMode(parsed.data.mode),
   };
   let result = await supabase.from("operations_agents").update(changes).eq("id", req.params.id).select("*").single();
+  if (result.error && /country|mode/i.test(result.error.message || "")) {
+    const { country: _c, mode: _m, ...withoutPlace } = changes;
+    result = await supabase.from("operations_agents").update(withoutPlace).eq("id", req.params.id).select("*").single();
+  }
   if (result.error && /phone/i.test(result.error.message || "")) {
     const { phone: _phone, ...withoutPhone } = changes;
     result = await supabase.from("operations_agents").update(withoutPhone).eq("id", req.params.id).select("*").single();
