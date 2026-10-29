@@ -182,7 +182,7 @@ router.get("/pipeline", async (req, res) => {
   ]);
   let directoryQuery = await supabase.from("operations_agents").select("id, company_name, contact_name, email, phone, country, mode, created_at").order("company_name");
   if (directoryQuery.error && /country|mode/i.test(directoryQuery.error.message || "")) {
-    directoryQuery = await supabase.from("operations_agents").select("id, company_name, contact_name, email, phone, created_at").order("company_name");
+    directoryQuery = await supabase.from("operations_agents").select("id, company_name, contact_name, email, phone, created_at").order("company_name") as typeof directoryQuery;
   }
   const customersQuery = await supabase.from("operations_customers").select("id, company_name, contact_name, email, phone, created_at").order("company_name");
   const directoryFallback = directoryQuery.error && /phone/i.test(directoryQuery.error.message || "")
@@ -527,7 +527,7 @@ router.post("/enquiries/:id/agents", async (req, res) => {
       .select("company_name, contact_name, email, phone, country, mode")
       .in("id", parsed.data.saved_agent_ids);
     if (savedQuery.error && /country|mode/i.test(savedQuery.error.message || "")) {
-      savedQuery = await supabase.from("operations_agents").select("company_name, contact_name, email, phone").in("id", parsed.data.saved_agent_ids);
+      savedQuery = await supabase.from("operations_agents").select("company_name, contact_name, email, phone").in("id", parsed.data.saved_agent_ids) as typeof savedQuery;
     }
     const savedFallback = savedQuery.error && /phone/i.test(savedQuery.error.message || "")
       ? await supabase.from("operations_agents").select("company_name, contact_name, email").in("id", parsed.data.saved_agent_ids)
@@ -607,7 +607,7 @@ async function rememberAgent(
   const who = String(contact || "").trim();
   let lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone, country, mode").ilike("company_name", name);
   if (lookup.error && /country|mode/i.test(lookup.error.message || "")) {
-    lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone").ilike("company_name", name);
+    lookup = await supabase.from("operations_agents").select("id, contact_name, email, phone").ilike("company_name", name) as typeof lookup;
   }
   const existing = lookup.error && /phone/i.test(lookup.error.message || "")
     ? await supabase.from("operations_agents").select("id, contact_name, email").ilike("company_name", name)
