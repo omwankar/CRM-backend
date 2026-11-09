@@ -1,7 +1,7 @@
 import express from "express";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
-import { authMiddleware } from "../middleware/auth.js";
+import { authMiddleware, invalidateAuthCacheForUser } from "../middleware/auth.js";
 import { auditLog } from "../middleware/auditLog.js";
 import { normalizeAppRole } from "../lib/roles.js";
 
@@ -896,6 +896,42 @@ router.delete("/enquiries/:id", async (req, res) => {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Could not delete the inquiry" });
   }
   res.json({ ok: true });
+});
+
+router.get("/crm-people", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const { data, error } = await supabase
+    .from("users")
+    .select("id, full_name, email, in_operations, is_active")
+    .eq("is_active", true)
+    .order("full_name");
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    data: (data || []).map((row) => ({
+      id: row.id,
+      full_name: row.full_name || row.email || "User",
+      email: row.email,
+      in_operations: Boolean(row.in_operations),
+    })),
+  });
+});
+
+router.post("/team", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const parsed = z.object({ user_ids: z.array(z.string().uuid()).min(1) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Choose someone from CRM" });
+  const { data, error } = await supabase
+    .from("users")
+    .update({ in_operations: true })
+    .in("id", parsed.data.user_ids)
+    .eq("is_active", true)
+    .select("id, full_name, email, in_operations");
+  if (error) return res.status(500).json({ error: error.message });
+  for (const row of data || []) invalidateAuthCacheForUser(row.id);
+  if (!data?.length) return res.status(404).json({ error: "No matching CRM users were found" });
+  res.json({ data });
 });
 
 router.delete("/pipeline", async (req, res) => {
