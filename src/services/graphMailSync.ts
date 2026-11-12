@@ -16,6 +16,11 @@ import {
   type GraphUser,
 } from "./graphClient.js";
 
+/** Inbox pull is off — do not fetch new Outlook mail into company_emails. */
+export function isEmailInboxSyncEnabled() {
+  return false;
+}
+
 let db: SupabaseClient | null = null;
 function supabase(): SupabaseClient {
   if (!db) {
@@ -896,6 +901,9 @@ export interface SyncResult {
 }
 
 export async function runEmailSync(): Promise<SyncResult> {
+  if (!isEmailInboxSyncEnabled()) {
+    throw new Error("Email inbox sync is disabled");
+  }
   clearLinkCache();
   const token = await getGraphAccessToken();
   const syncDays = Math.max(1, Number(process.env.MS_GRAPH_SYNC_DAYS || 30));

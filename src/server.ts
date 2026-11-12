@@ -143,7 +143,7 @@ app.listen(env.PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`Backend listening on http://localhost:${env.PORT}`);
   console.log(
-    `[graph] Microsoft 365 sync: ${isGraphConfigured() ? "configured" : "NOT configured — add MS_GRAPH_* to backend/.env and restart"}`,
+    `[graph] Microsoft 365 inbox sync: disabled (no new emails will be pulled)`,
   );
   console.log(
     `[graph] Outbound mail (quotations/invoices): ${isGraphSendConfigured() ? "configured" : "NOT configured — set MS_GRAPH_SEND_FROM_EMAIL in backend/.env"}`,

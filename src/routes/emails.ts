@@ -4,7 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { authMiddleware } from "../middleware/auth.js";
 import { requireRole, requireSuperAdmin } from "../middleware/requireRole.js";
 import { isGraphConfigured, getSyncAllowlist } from "../services/graphClient.js";
-import { discoverTenantMailboxes, fetchMessageBody, runEmailSync, backfillEmailSignatures, startFullSignatureBackfill, isFullSignatureBackfillRunning, guessCompanyFromSender } from "../services/graphMailSync.js";
+import { discoverTenantMailboxes, fetchMessageBody, runEmailSync, backfillEmailSignatures, startFullSignatureBackfill, isFullSignatureBackfillRunning, guessCompanyFromSender, isEmailInboxSyncEnabled } from "../services/graphMailSync.js";
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -228,6 +228,9 @@ router.get("/discover", requireSuperAdmin, async (_req, res) => {
 
 // POST /api/emails/sync — manual sync trigger
 router.post("/sync", requireSuperAdmin, async (_req, res) => {
+  if (!isEmailInboxSyncEnabled()) {
+    return res.status(403).json({ error: "Email inbox sync is disabled. New Outlook mail is not pulled into CRM." });
+  }
   if (!isGraphConfigured()) {
     return res.status(503).json({ error: "Microsoft Graph is not configured on the server" });
   }
@@ -251,6 +254,9 @@ router.post("/sync", requireSuperAdmin, async (_req, res) => {
 // Re-fetch / re-parse phone+company for emails.
 // body: { all?: true, force?: true, limit?: number }
 router.post("/backfill-signatures", requireSuperAdmin, async (req, res) => {
+  if (!isEmailInboxSyncEnabled()) {
+    return res.status(403).json({ error: "Email inbox sync is disabled. Signature backfill is turned off." });
+  }
   const all = Boolean(req.body?.all);
   const force = Boolean(req.body?.force ?? all);
 
@@ -583,6 +589,9 @@ export function registerEmailSyncInternalRoute(api: express.Router) {
     const secret = process.env.EMAIL_SYNC_CRON_SECRET;
     if (!secret || req.headers["x-cron-secret"] !== secret) {
       return res.status(401).json({ error: "Unauthorized" });
+    }
+    if (!isEmailInboxSyncEnabled()) {
+      return res.status(403).json({ error: "Email inbox sync is disabled" });
     }
     if (!isGraphConfigured()) {
       return res.status(503).json({ error: "Microsoft Graph is not configured" });
