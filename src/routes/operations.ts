@@ -954,23 +954,6 @@ router.post("/team", async (req, res) => {
   res.json({ data });
 });
 
-router.delete("/pipeline", async (req, res) => {
-  const access = await requireOperations(req, res);
-  if (!access) return;
-  if (!access.superAdmin) return res.status(403).json({ error: "Only a super admin can clear the operations pipeline" });
-  const ids = await operationsEnquiryIds();
-  let deleted = 0;
-  for (const id of ids) {
-    try {
-      await deleteOperationsEnquiryById(id);
-      deleted += 1;
-    } catch (err) {
-      return res.status(500).json({ error: err instanceof Error ? err.message : "Could not clear the pipeline" });
-    }
-  }
-  res.json({ ok: true, deleted });
-});
-
 const customerSchema = z.object({
   company_name: z.string().trim().min(2),
   contact_name: z.string().trim().optional().nullable(),
