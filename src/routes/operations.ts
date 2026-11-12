@@ -700,6 +700,26 @@ router.put("/agents/:id", async (req, res) => {
   res.json(data);
 });
 
+router.delete("/agents/:id", async (req, res) => {
+  const access = await requireOperations(req, res);
+  if (!access) return;
+  const { data: send } = await supabase.from("enquiry_agent_sends").select("*").eq("id", req.params.id).maybeSingle();
+  if (!send) return res.status(404).json({ error: "Agent send not found" });
+  if (send.user_id !== access.userId && !access.superAdmin) {
+    return res.status(403).json({ error: "You can only remove the agents you added" });
+  }
+  if (send.vendor_quote_id) {
+    const { data: quote } = await supabase.from("quotation_vendor_quotes").select("quotation_id, is_chosen").eq("id", send.vendor_quote_id).maybeSingle();
+    if (quote?.is_chosen) {
+      await supabase.from("quotations").update({ chosen_quote_id: null, updated_by: access.userId }).eq("id", quote.quotation_id);
+      await supabase.from("quotation_vendor_quotes").update({ is_chosen: false }).eq("id", send.vendor_quote_id);
+    }
+  }
+  const { error } = await supabase.from("enquiry_agent_sends").delete().eq("id", send.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
 // POST /api/operations/agents/:id/best — this person's best rate becomes the enquiry's chosen quote
 router.post("/agents/:id/best", async (req, res) => {
   const access = await requireOperations(req, res);
